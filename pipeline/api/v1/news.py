@@ -4,8 +4,6 @@ from pipeline.schemas.crawl_request import CrawlJobRequest
 from pipeline.schemas.news_request import NewsCrawlRequest
 from pipeline.schemas.news_response import NewsCrawlResponse
 from pipeline.services.container import crawl_orchestrator
-from pipeline.services.news_pipeline_service import crawl_news
-
 
 router = APIRouter(prefix="/news", tags=["news"])
 
