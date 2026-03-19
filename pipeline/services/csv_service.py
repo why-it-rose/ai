@@ -15,7 +15,7 @@ class CsvService:
         stocks: List[StockNewsResponse],
     ) -> str:
         for stock in stocks:
-            file_path = os.path.join(self.output_dir, stock.stock_name)
+            file_path = os.path.join(self.output_dir, stock.stock_name + ".csv")
 
             with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.DictWriter(
