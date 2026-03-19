@@ -6,16 +6,19 @@ from pipeline.schemas.news_response import StockNewsResponse
 
 
 class CsvService:
-    def __init__(self, output_dir: str = "output"):
+    def __init__(self, output_dir: str = "../files/crawled"):
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
 
     def write_stock_csv(
         self,
         stocks: List[StockNewsResponse],
-    ) -> str:
+    ) -> List[str]:
+
+        file_paths = []
         for stock in stocks:
-            file_path = os.path.join(self.output_dir, stock.stock_name)
+            file_path = os.path.join(self.output_dir, stock.stock_name + ".csv")
+            file_paths.append(file_path)
 
             with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.DictWriter(
@@ -43,4 +46,4 @@ class CsvService:
                         }
                     )
 
-        return file_path
+        return file_paths

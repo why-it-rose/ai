@@ -16,6 +16,7 @@
 ## 실행 방법
 1. 프로젝트를 클론합니다:
    ```bash
+   git lfs install
    git clone <repository-url>
    cd <repository-folder>"# ai" 
    ```
