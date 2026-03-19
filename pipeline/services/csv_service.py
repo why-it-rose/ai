@@ -2,7 +2,7 @@ import csv
 import os
 from typing import List
 
-from pipeline.schemas.news_response import NewsItemResponse
+from pipeline.schemas.news_response import StockNewsResponse
 
 
 class CsvService:
@@ -12,35 +12,35 @@ class CsvService:
 
     def write_stock_csv(
         self,
-        news_list: List[NewsItemResponse],
-        file_name: str = "news.csv",
+        stocks: List[StockNewsResponse],
     ) -> str:
-        file_path = os.path.join(self.output_dir, file_name)
+        for stock in stocks:
+            file_path = os.path.join(self.output_dir, stock.stock_name)
 
-        with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(
-                f,
-                fieldnames=[
-                    "title",
-                    "content",
-                    "url",
-                    "publishedAt",
-                    "source",
-                    "thumbnailUrl",
-                ],
-            )
-            writer.writeheader()
-
-            for news in news_list:
-                writer.writerow(
-                    {
-                        "title": news.title,
-                        "content": news.content,
-                        "url": news.url,
-                        "publishedAt": news.publishedAt,
-                        "source": news.source,
-                        "thumbnailUrl": news.thumbnailUrl,
-                    }
+            with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=[
+                        "title",
+                        "content",
+                        "url",
+                        "publishedAt",
+                        "source",
+                        "thumbnailUrl",
+                    ],
                 )
+                writer.writeheader()
+
+                for news in stock.news:
+                    writer.writerow(
+                        {
+                            "title": news.title,
+                            "content": news.content,
+                            "url": news.url,
+                            "publishedAt": news.publishedAt,
+                            "source": news.source,
+                            "thumbnailUrl": news.thumbnailUrl,
+                        }
+                    )
 
         return file_path

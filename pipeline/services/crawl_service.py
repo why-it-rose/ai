@@ -7,12 +7,13 @@ class CrawlService:
         self.crawler = YonhapCrawler()
 
     async def collect(self, targets) -> NewsCrawlResponse:
-        all_news = []
-
+        stocks = []
         for target in targets:
+            news = []
             for period in target.periods:
+                # 이벤트 1개별
                 articles = await self.crawler.crawl(
-                    keyword=target.keyword,
+                    stock=target.stock,
                     fromDate=period.fromDate,
                     toDate=period.toDate,
                 )
@@ -28,9 +29,13 @@ class CrawlService:
                     )
                     for article in articles
                 ]
-                all_news.extend(items)
+                news.extend(items)
+            stocks.append({
+                "stock_name": target.stock,
+                "news": news,
+            })
 
         return NewsCrawlResponse(
-            count=len(all_news),
-            items=all_news,
+            count=len(stocks),
+            stocks=stocks,
         )

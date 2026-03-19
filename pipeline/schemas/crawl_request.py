@@ -7,7 +7,7 @@ class CrawlPeriod(BaseModel):
     toDate: str
 
 class CrawlTarget(BaseModel):
-    keyword: str
+    stock: str
     periods: List[CrawlPeriod]
 
 class CrawlJobRequest(BaseModel):
