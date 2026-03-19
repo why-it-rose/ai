@@ -36,13 +36,13 @@ class YonhapCrawler(BaseCrawler):
 
     async def crawl(
         self,
-        keyword: Optional[str] = None,
+        stock: Optional[str] = None,
         fromDate: Optional[str] = None,
         toDate: Optional[str] = None,
         limit: int = 1000,
     ) -> list[dict]:
-        if not keyword:
-            raise ValueError("keyword는 필수입니다.")
+        if not stock:
+            raise ValueError("stock값은 필수입니다.")
         if not fromDate or not toDate:
             raise ValueError("fromDate와 toDate는 필수입니다.")
 
@@ -74,7 +74,7 @@ class YonhapCrawler(BaseCrawler):
                     break
 
                 search_url = self._build_search_url(
-                    query=keyword,
+                    query=stock,
                     start_date_dot=fromDate,
                     end_date_dot=toDate,
                     start=start,
@@ -107,7 +107,7 @@ class YonhapCrawler(BaseCrawler):
 
                     try:
                         article = await self._parse_article(url, client)
-                        article["stock"] = keyword
+                        article["stock"] = stock
                         raw_items.append(article)
                     except httpx.HTTPError as e:
                         self.logger.warning("기사 요청 실패: %s / %s", url, e)

@@ -5,9 +5,9 @@ class CrawlOrchestrator:
 
     async def run(self, request):
         response = await self.crawl_service.collect(request.targets)
-        file_path = self.csv_service.write_stock_csv(response.items)
+        file_path = self.csv_service.write_stock_csv(response.stocks)
         return {
             "count": response.count,
-            "items": response.items,
+            "stocks": response.stocks,
             "file_path": file_path,
         }

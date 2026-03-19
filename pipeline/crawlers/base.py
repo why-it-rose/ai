@@ -5,7 +5,7 @@ class BaseCrawler(ABC):
     @abstractmethod
     def crawl(
         self,
-        keyword: str | None = None,
+        stock: str | None = None,
         from_date: str | None = None,
         to_date: str | None = None,
         limit: int = 10,

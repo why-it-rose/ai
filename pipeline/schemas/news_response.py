@@ -1,6 +1,7 @@
 from pydantic import BaseModel
 from typing import List, Optional
 
+
 class NewsItemResponse(BaseModel):
     title: str
     content: str
@@ -9,6 +10,11 @@ class NewsItemResponse(BaseModel):
     source: Optional[str] = None
     thumbnailUrl: Optional[str] = None
 
+
+class StockNewsResponse(BaseModel):
+    stock_name: str
+    news: List[NewsItemResponse]
+
 class NewsCrawlResponse(BaseModel):
     count: int
-    items: List[NewsItemResponse]
+    stocks: List[StockNewsResponse]
