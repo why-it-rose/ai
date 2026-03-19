@@ -6,7 +6,7 @@ from pipeline.schemas.news_response import StockNewsResponse
 
 
 class CsvService:
-    def __init__(self, output_dir: str = "output"):
+    def __init__(self, output_dir: str = "../files/crawled"):
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
 
