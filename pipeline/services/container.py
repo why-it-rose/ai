@@ -2,13 +2,20 @@ from pipeline.services.crawl_orchestrator import CrawlOrchestrator
 from pipeline.services.crawl_service import CrawlService
 from pipeline.services.csv_service import CsvService
 from pipeline.services.tag_service import TagService
+from pipeline.services.transfer_service import TransferService
+from dotenv import dotenv_values
+
+DB_CONFIG = dotenv_values(".env").get("DB_CONFIG")
+
 
 crawl_service = CrawlService()
 csv_service = CsvService()
 tag_service = TagService()
+transfer_service = TransferService(batch_size=500)
 
 crawl_orchestrator = CrawlOrchestrator(
     crawl_service=crawl_service,
     csv_service = csv_service,
     tag_service = tag_service,
+    transfer_service = transfer_service,
 )
