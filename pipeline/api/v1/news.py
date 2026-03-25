@@ -5,10 +5,13 @@ import logging
 
 router = APIRouter(prefix="/news", tags=["news"])
 logger = logging.getLogger(__name__)
+
+
 @router.get("/crawl")
 async def crawl_news(background_tasks: BackgroundTasks):
     background_tasks.add_task(run_crawl_job)
     return {"message": "작업이 등록됐습니다."}
+
 
 async def run_crawl_job():
     try:

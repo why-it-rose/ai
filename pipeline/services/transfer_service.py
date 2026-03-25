@@ -21,11 +21,11 @@ def _now() -> str:
 
 def _parse_dt(value: str) -> str:
     for fmt in (
-        "%Y-%m-%dT%H:%M:%S%z",
-        "%Y-%m-%dT%H:%M:%S.%f%z",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M:%S.%f",
-        "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S%z",
+            "%Y-%m-%dT%H:%M:%S.%f%z",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M:%S.%f",
+            "%Y-%m-%dT%H:%M:%S",
     ):
         try:
             dt = datetime.strptime(value.strip(), fmt)
@@ -335,7 +335,7 @@ class TransferService:
 
         with conn.cursor() as cur:
             for i in range(0, len(news_rows), self.batch_size):
-                batch = news_rows[i : i + self.batch_size]
+                batch = news_rows[i: i + self.batch_size]
                 affected = cur.executemany(insert_sql, batch)
                 inserted_count += affected
 
@@ -350,7 +350,7 @@ class TransferService:
 
         with conn.cursor() as cur:
             for i in range(0, len(unique_urls), self.batch_size):
-                chunk = unique_urls[i : i + self.batch_size]
+                chunk = unique_urls[i: i + self.batch_size]
                 placeholders = ",".join(["%s"] * len(chunk))
                 cur.execute(
                     f"""
@@ -366,11 +366,11 @@ class TransferService:
         return result
 
     def _bulk_insert_junction(
-        self,
-        conn,
-        news_stocks_rows: list[tuple],
-        news_tags_rows: list[tuple],
-        event_news_rows: list[tuple],
+            self,
+            conn,
+            news_stocks_rows: list[tuple],
+            news_tags_rows: list[tuple],
+            event_news_rows: list[tuple],
     ) -> tuple[int, int, int]:
         inserted_ns = 0
         inserted_nt = 0
@@ -418,24 +418,6 @@ class TransferService:
         except (ValueError, TypeError):
             return 0.0
 
-    @staticmethod
-    def _mark_events_active(conn, event_ids: list[int]) -> None:
-        if not event_ids:
-            return
-
-        placeholders = ",".join(["%s"] * len(event_ids))
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                UPDATE events
-                SET crawl_status = 'ACTIVE',
-                    updated_at = %s
-                WHERE id IN ({placeholders})
-                  AND crawl_status = 'PENDING'
-                """,
-                [_now(), *event_ids],
-            )
-
     def _find_activatable_event_ids(self, conn, expected_event_urls: dict[int, set[str]]) -> list[int]:
         event_ids = list(expected_event_urls.keys())
         actual_counts = self._load_event_news_counts(conn, event_ids)
@@ -470,3 +452,21 @@ class TransferService:
                 actual_counts[row["event_id"]] = row["count"]
 
         return actual_counts
+
+    @staticmethod
+    def _mark_events_active(conn, event_ids: list[int]) -> None:
+        if not event_ids:
+            return
+
+        placeholders = ",".join(["%s"] * len(event_ids))
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                    UPDATE events
+                    SET crawl_status = 'ACTIVE',
+                        updated_at = %s
+                    WHERE id IN ({placeholders})
+                      AND crawl_status = 'PENDING'
+                    """,
+                [_now(), *event_ids],
+            )

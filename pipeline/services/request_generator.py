@@ -39,22 +39,6 @@ class RequestGenerator:
 
             return self.build_targets(events)
 
-    @staticmethod
-    def _load_crawl_target_events(conn) -> list[dict]:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    e.id AS event_id,
-                    s.name AS stock_name,
-                    e.start_date,
-                    e.end_date
-                FROM events e
-                JOIN stocks s ON s.id = e.stock_id
-                WHERE e.crawl_status = 'INACTIVE';
-                """
-            )
-            return list(cur.fetchall())
     def build_targets(self, rows: list[dict]) -> CrawlJobRequest:
         grouped = defaultdict(list)
 
@@ -76,6 +60,23 @@ class RequestGenerator:
                 for stock, periods in grouped.items()
             ]
         )
+
+    @staticmethod
+    def _load_crawl_target_events(conn) -> list[dict]:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    e.id AS event_id,
+                    s.name AS stock_name,
+                    e.start_date,
+                    e.end_date
+                FROM events e
+                JOIN stocks s ON s.id = e.stock_id
+                WHERE e.crawl_status = 'INACTIVE';
+                """
+            )
+            return list(cur.fetchall())
 
     @staticmethod
     def _mark_events_pending(conn, event_ids: list[int]) -> None:

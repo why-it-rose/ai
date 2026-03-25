@@ -8,7 +8,6 @@ class CrawlOrchestrator:
 
     async def run(self):
         request = self.request_generator.generate()
-        print("Generated request:", request)
         response = await self.crawl_service.collect(request.targets)
         crawled_file_paths = self.csv_service.write_stock_csv(response.stocks)
         tagged_file_paths = self.tag_service.tag_csv(crawled_file_paths)

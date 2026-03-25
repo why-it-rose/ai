@@ -17,7 +17,7 @@ transfer_service = TransferService(batch_size=500)
 crawl_orchestrator = CrawlOrchestrator(
     request_generator=request_generator,
     crawl_service=crawl_service,
-    csv_service = csv_service,
-    tag_service = tag_service,
-    transfer_service = transfer_service,
+    csv_service=csv_service,
+    tag_service=tag_service,
+    transfer_service=transfer_service,
 )
