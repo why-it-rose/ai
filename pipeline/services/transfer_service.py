@@ -108,7 +108,6 @@ class TransferService:
 
             tag_map = self._load_tag_ids_for_names(conn, tag_names)
 
-            # 1) news 본테이블: 청크 내부 URL 중복만 제거해서 INSERT IGNORE
             news_rows: list[tuple] = []
             seen_chunk_urls: set[str] = set()
 
@@ -135,7 +134,6 @@ class TransferService:
             inserted_count = self._bulk_insert_news_ignore(conn, news_rows)
             total_news_new += inserted_count
 
-            # 2) 방금 청크의 URL들만 다시 조회해서 url -> news_id 확보
             url_to_id = self._load_url_to_id_by_urls(conn, list(seen_chunk_urls))
 
             if not url_to_id:
@@ -143,12 +141,10 @@ class TransferService:
                 logger.info("  → chunk=%d 매핑 가능한 news_id 없음", chunk_count)
                 continue
 
-            # 3) junction row 생성
             news_stocks_rows: list[tuple] = []
             news_tags_rows: list[tuple] = []
             event_news_rows: list[tuple] = []
 
-            # 같은 청크 내부 중복만 얕게 제거
             seen_news_stock_pairs: set[tuple[int, int]] = set()
             seen_news_tag_pairs: set[tuple[int, int]] = set()
             seen_event_news_pairs: set[tuple[int, int]] = set()
