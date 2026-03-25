@@ -1,7 +1,7 @@
 from fastapi import APIRouter, BackgroundTasks
 
 from pipeline.schemas.crawl_request import CrawlJobRequest
-from pipeline.services.container import crawl_orchestrator, transfer_service
+from pipeline.services.container import crawl_orchestrator
 
 import logging
 
