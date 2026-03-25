@@ -86,8 +86,10 @@ class TransferService:
                 self._process_csv(conn, csv_path, stock_id)
                 logger.info("처리 완료: %s", csv_path.name)
 
+    # 각 stock csv파일마다 진행
     def _process_csv(self, conn, csv_path: Path, stock_id: int) -> None:
-        stock_events = self._load_active_events_for_stock(conn, stock_id)
+        stock_events = self._load_pending_events_for_stock(conn, stock_id)
+        expected_event_urls = {event["id"]: set() for event in stock_events}
 
         total_news_new = 0
         total_news_link = 0
@@ -98,6 +100,13 @@ class TransferService:
         for rows in self._iter_csv_chunks(csv_path):
             chunk_count += 1
             now = _now()
+
+            # 이벤트마다 연결된 뉴스 수
+            for row in rows:
+                published_date = row["_published_date"]
+                for event in stock_events:
+                    if event["start_date"] <= published_date <= event["end_date"]:
+                        expected_event_urls[event["id"]].add(row["_url"])
 
             tag_names = set()
             for row in rows:
@@ -215,6 +224,11 @@ class TransferService:
                 inserted_en,
             )
 
+        activatable_event_ids = self._find_activatable_event_ids(conn, expected_event_urls)
+        if activatable_event_ids:
+            self._mark_events_active(conn, activatable_event_ids)
+            conn.commit()
+
         logger.info(
             "  → total news_new=%d, news_stocks=%d, news_tags=%d, event_news=%d",
             total_news_new,
@@ -247,14 +261,14 @@ class TransferService:
             return row["id"] if row else None
 
     @staticmethod
-    def _load_active_events_for_stock(conn, stock_id: int) -> list[dict]:
+    def _load_pending_events_for_stock(conn, stock_id: int) -> list[dict]:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT id, start_date, end_date
                 FROM events
                 WHERE stock_id = %s
-                  AND status = 'ACTIVE'
+                  AND crawl_status = 'PENDING'
                 ORDER BY start_date
                 """,
                 (stock_id,),
@@ -403,3 +417,56 @@ class TransferService:
             return round((major + sub) / 2, 4)
         except (ValueError, TypeError):
             return 0.0
+
+    @staticmethod
+    def _mark_events_active(conn, event_ids: list[int]) -> None:
+        if not event_ids:
+            return
+
+        placeholders = ",".join(["%s"] * len(event_ids))
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE events
+                SET crawl_status = 'ACTIVE',
+                    updated_at = %s
+                WHERE id IN ({placeholders})
+                  AND crawl_status = 'PENDING'
+                """,
+                [_now(), *event_ids],
+            )
+
+    def _find_activatable_event_ids(self, conn, expected_event_urls: dict[int, set[str]]) -> list[int]:
+        event_ids = list(expected_event_urls.keys())
+        actual_counts = self._load_event_news_counts(conn, event_ids)
+
+        result = []
+        for event_id, urls in expected_event_urls.items():
+            expected_count = len(urls)
+            actual_count = actual_counts.get(event_id, 0)
+            logger.info("이벤트 %d: 예상 뉴스=%d, 실제 뉴스=%d", event_id, expected_count, actual_count)
+            if actual_count >= expected_count:
+                result.append(event_id)
+        return result
+
+    def _load_event_news_counts(self, conn, event_ids: list[int]) -> dict[int, int]:
+        if not event_ids:
+            return {}
+
+        placeholders = ", ".join(["%s"] * len(event_ids))
+        actual_counts = {event_id: 0 for event_id in event_ids}
+
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT event_id, COUNT(DISTINCT news_id) AS count
+                FROM event_news
+                WHERE event_id IN ({placeholders})
+                GROUP BY event_id
+                """,
+                event_ids,
+            )
+            for row in cur.fetchall():
+                actual_counts[row["event_id"]] = row["count"]
+
+        return actual_counts
