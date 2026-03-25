@@ -1,7 +1,6 @@
 import csv
 import os
 from typing import List
-
 from pipeline.schemas.news_response import StockNewsResponse
 
 
@@ -11,8 +10,8 @@ class CsvService:
         os.makedirs(self.output_dir, exist_ok=True)
 
     def write_stock_csv(
-        self,
-        stocks: List[StockNewsResponse],
+            self,
+            stocks: List[StockNewsResponse],
     ) -> List[str]:
 
         file_paths = []

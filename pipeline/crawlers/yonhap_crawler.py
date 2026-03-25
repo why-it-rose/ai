@@ -24,10 +24,10 @@ class YonhapCrawler(BaseCrawler):
     MAX_NO_NEW_PAGES = 5
 
     def __init__(
-        self,
-        office_id: str = "1001",
-        delay: float = 0.15,
-        max_pages: int = 0,
+            self,
+            office_id: str = "1001",
+            delay: float = 0.15,
+            max_pages: int = 0,
     ):
         self.office_id = office_id
         self.delay = max(delay, 0.0)
@@ -35,11 +35,11 @@ class YonhapCrawler(BaseCrawler):
         self.logger = logging.getLogger(__name__)
 
     async def crawl(
-        self,
-        stock: Optional[str] = None,
-        fromDate: Optional[str] = None,
-        toDate: Optional[str] = None,
-        limit: int = 1000,
+            self,
+            stock: Optional[str] = None,
+            fromDate: Optional[str] = None,
+            toDate: Optional[str] = None,
+            limit: int = 1000,
     ) -> list[dict]:
         if not stock:
             raise ValueError("stock값은 필수입니다.")
@@ -56,9 +56,9 @@ class YonhapCrawler(BaseCrawler):
             raise ValueError("limit는 1 이상이어야 합니다.")
 
         async with httpx.AsyncClient(
-            headers={"User-Agent": self.USER_AGENT},
-            timeout=20.0,
-            follow_redirects=True,
+                headers={"User-Agent": self.USER_AGENT},
+                timeout=20.0,
+                follow_redirects=True,
         ) as client:
             seen_urls: Set[str] = set()
             raw_items: list[dict] = []
@@ -127,12 +127,12 @@ class YonhapCrawler(BaseCrawler):
             return deduped[:limit]
 
     def _build_search_url(
-        self,
-        query: str,
-        start_date_dot: str,
-        end_date_dot: str,
-        start: int,
-        office_id: str = "1001",
+            self,
+            query: str,
+            start_date_dot: str,
+            end_date_dot: str,
+            start: int,
+            office_id: str = "1001",
     ) -> str:
         compact_start = self._to_compact_date(start_date_dot)
         compact_end = self._to_compact_date(end_date_dot)
@@ -257,10 +257,10 @@ class YonhapCrawler(BaseCrawler):
                     continue
 
                 thumbnail_url = (
-                    node.get("data-src")
-                    or node.get("src")
-                    or node.get("data-lazy-src")
-                    or ""
+                        node.get("data-src")
+                        or node.get("src")
+                        or node.get("data-lazy-src")
+                        or ""
                 ).strip()
 
                 if thumbnail_url:

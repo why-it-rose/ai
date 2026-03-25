@@ -15,6 +15,7 @@ class StockNewsResponse(BaseModel):
     stock_name: str
     news: List[NewsItemResponse]
 
+
 class NewsCrawlResponse(BaseModel):
     count: int
     stocks: List[StockNewsResponse]

@@ -9,7 +9,6 @@ import torch.nn as nn
 
 from transformers import AutoTokenizer, AutoModel
 
-
 # =========================
 # 현재 파일 기준 경로
 # =========================
@@ -232,8 +231,8 @@ def merge_existing_predictions(input_df, output_df):
 
 def find_rows_to_predict(df):
     need_mask = (
-        df["pred_major"].fillna("").astype(str).str.strip().eq("") |
-        df["pred_sub"].fillna("").astype(str).str.strip().eq("")
+            df["pred_major"].fillna("").astype(str).str.strip().eq("") |
+            df["pred_sub"].fillna("").astype(str).str.strip().eq("")
     )
     return df[need_mask].copy()
 
