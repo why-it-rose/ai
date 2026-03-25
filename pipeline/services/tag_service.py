@@ -289,7 +289,7 @@ class TagService:
                 print("이미 모든 행에 예측값이 채워져 있습니다.")
                 base_df.to_csv(output_csv_path, index=False, encoding="utf-8-sig")
                 print(f"결과 파일 유지 완료: {output_csv_path}")
-                return output_csv_path
+                continue
 
             texts = [
                 self.predictor.build_text(title=row["title"], content=row["content"])
