@@ -15,5 +15,5 @@ class CrawlOrchestrator:
             "count": response.count,
             "stocks": response.stocks,
             "file_path": crawled_file_paths,
-            "tagged_file_path": tagged_file_paths,
+            "tagged_file_paths": tagged_file_paths,
         }
