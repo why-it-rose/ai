@@ -15,6 +15,6 @@ async def crawl_news(request: CrawlJobRequest, background_tasks: BackgroundTasks
 async def run_crawl_job(request: CrawlJobRequest):
     try:
         result = await crawl_orchestrator.run(request)
-        logger.info("크롤링 작업 완료: %s", result)
+        logger.info("크롤링 작업 완료")
     except Exception as e:
         logger.exception("크롤링 작업 실패: %s", e)

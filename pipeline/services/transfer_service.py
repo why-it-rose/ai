@@ -2,6 +2,7 @@ import csv
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterator
 
 import pymysql
 import pymysql.cursors
@@ -54,6 +55,7 @@ class TransferService:
     def transfer_all(self, tagged_file_paths: list[str] | str) -> None:
         if isinstance(tagged_file_paths, str):
             tagged_file_paths = [tagged_file_paths]
+
         csv_files = [Path(p) for p in tagged_file_paths]
         logger.info("csv_files=%s", csv_files)
 
@@ -71,23 +73,159 @@ class TransferService:
             logger.warning("처리할 수 있는 CSV 파일이 없습니다.")
             return
 
-        # DB연결 및 사전 로딩
         with self._connect() as conn:
-            tag_map = self._load_tag_map(conn)
-            stock_map = self._load_stock_map(conn)
-            event_map = self._load_event_map(conn)
-
             for csv_path in exists_files:
                 company_name = csv_path.stem
-                stock_id = stock_map.get(company_name)
+                stock_id = self._resolve_stock_id(conn, company_name)
 
                 if stock_id is None:
-                    logger.warning("잘못된 종목이 입력되었습니다.", company_name)
+                    logger.warning("stocks 테이블에 없는 종목입니다: %s", company_name)
                     continue
 
                 logger.info("처리 시작: %s (stock_id=%s)", csv_path.name, stock_id)
-                self._process_csv(conn, csv_path, stock_id, tag_map, event_map)
+                self._process_csv(conn, csv_path, stock_id)
                 logger.info("처리 완료: %s", csv_path.name)
+
+    def _process_csv(self, conn, csv_path: Path, stock_id: int) -> None:
+        stock_events = self._load_active_events_for_stock(conn, stock_id)
+
+        total_news_new = 0
+        total_news_link = 0
+        total_tag_link = 0
+        total_event_link = 0
+        chunk_count = 0
+
+        for rows in self._iter_csv_chunks(csv_path):
+            chunk_count += 1
+            now = _now()
+
+            tag_names = set()
+            for row in rows:
+                for pred_col in ("pred_major", "pred_sub"):
+                    tag_name = (row.get(pred_col) or "").strip()
+                    if tag_name:
+                        tag_names.add(tag_name)
+
+            tag_map = self._load_tag_ids_for_names(conn, tag_names)
+
+            # 1) news 본테이블: 청크 내부 URL 중복만 제거해서 INSERT IGNORE
+            news_rows: list[tuple] = []
+            seen_chunk_urls: set[str] = set()
+
+            for row in rows:
+                url = row["_url"]
+                if url in seen_chunk_urls:
+                    continue
+
+                seen_chunk_urls.add(url)
+                news_rows.append(
+                    (
+                        now,
+                        now,
+                        row.get("content", ""),
+                        row["_published_at"],
+                        row.get("source", ""),
+                        STATUS_ACTIVE,
+                        row.get("thumbnailUrl") or None,
+                        row.get("title", ""),
+                        url,
+                    )
+                )
+
+            inserted_count = self._bulk_insert_news_ignore(conn, news_rows)
+            total_news_new += inserted_count
+
+            # 2) 방금 청크의 URL들만 다시 조회해서 url -> news_id 확보
+            url_to_id = self._load_url_to_id_by_urls(conn, list(seen_chunk_urls))
+
+            if not url_to_id:
+                conn.commit()
+                logger.info("  → chunk=%d 매핑 가능한 news_id 없음", chunk_count)
+                continue
+
+            # 3) junction row 생성
+            news_stocks_rows: list[tuple] = []
+            news_tags_rows: list[tuple] = []
+            event_news_rows: list[tuple] = []
+
+            # 같은 청크 내부 중복만 얕게 제거
+            seen_news_stock_pairs: set[tuple[int, int]] = set()
+            seen_news_tag_pairs: set[tuple[int, int]] = set()
+            seen_event_news_pairs: set[tuple[int, int]] = set()
+
+            for row in rows:
+                news_id = url_to_id.get(row["_url"])
+                if not news_id:
+                    continue
+
+                news_stock_pair = (news_id, stock_id)
+                if news_stock_pair not in seen_news_stock_pairs:
+                    news_stocks_rows.append((now, now, STATUS_ACTIVE, news_id, stock_id))
+                    seen_news_stock_pairs.add(news_stock_pair)
+
+                for pred_col in ("pred_major", "pred_sub"):
+                    tag_name = (row.get(pred_col) or "").strip()
+                    if not tag_name:
+                        continue
+
+                    tag_id = tag_map.get(tag_name)
+                    if not tag_id:
+                        logger.debug("태그 미존재: '%s'", tag_name)
+                        continue
+
+                    news_tag_pair = (news_id, tag_id)
+                    if news_tag_pair not in seen_news_tag_pairs:
+                        news_tags_rows.append((now, now, STATUS_ACTIVE, news_id, tag_id))
+                        seen_news_tag_pairs.add(news_tag_pair)
+
+                published_date = row["_published_date"]
+                relevance_score = self._calc_relevance(row)
+
+                for event in stock_events:
+                    if event["start_date"] <= published_date <= event["end_date"]:
+                        event_news_pair = (event["id"], news_id)
+                        if event_news_pair not in seen_event_news_pairs:
+                            event_news_rows.append(
+                                (
+                                    now,
+                                    now,
+                                    relevance_score,
+                                    STATUS_ACTIVE,
+                                    event["id"],
+                                    news_id,
+                                )
+                            )
+                            seen_event_news_pairs.add(event_news_pair)
+
+            inserted_ns, inserted_nt, inserted_en = self._bulk_insert_junction(
+                conn,
+                news_stocks_rows,
+                news_tags_rows,
+                event_news_rows,
+            )
+
+            total_news_link += inserted_ns
+            total_tag_link += inserted_nt
+            total_event_link += inserted_en
+
+            conn.commit()
+
+            logger.info(
+                "  → chunk=%d news_new=%d, news_stocks=%d, news_tags=%d, event_news=%d",
+                chunk_count,
+                inserted_count,
+                inserted_ns,
+                inserted_nt,
+                inserted_en,
+            )
+
+        logger.info(
+            "  → total news_new=%d, news_stocks=%d, news_tags=%d, event_news=%d",
+            total_news_new,
+            total_news_link,
+            total_tag_link,
+            total_event_link,
+        )
 
     def _connect(self) -> pymysql.connections.Connection:
         return pymysql.connect(
@@ -97,190 +235,60 @@ class TransferService:
         )
 
     @staticmethod
-    def _load_tag_map(conn) -> dict[str, int]:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, name FROM tags WHERE status = 'ACTIVE'")
-            return {row["name"]: row["id"] for row in cur.fetchall()}
-
-    @staticmethod
-    def _load_stock_map(conn) -> dict[str, int]:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, name FROM stocks WHERE status = 'ACTIVE'")
-            return {row["name"]: row["id"] for row in cur.fetchall()}
-
-    @staticmethod
-    def _load_event_map(conn) -> dict[int, list[dict]]:
+    def _resolve_stock_id(conn, company_name: str) -> int | None:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, stock_id, start_date, end_date
-                FROM events
-                WHERE status = 'ACTIVE'
-                ORDER BY stock_id, start_date
-                """
+                SELECT id
+                FROM stocks
+                WHERE name = %s
+                  AND status = 'ACTIVE'
+                LIMIT 1
+                """,
+                (company_name,),
             )
-            result: dict[int, list[dict]] = {}
-            for row in cur.fetchall():
-                result.setdefault(row["stock_id"], []).append(row)
-            return result
-
-    def _process_csv(
-        self,
-        conn,
-        csv_path: Path,
-        stock_id: int,
-        tag_map: dict[str, int],
-        event_map: dict[int, list[dict]],
-    ) -> None:
-        rows = self._read_csv(csv_path)
-        if not rows:
-            logger.info("빈 CSV입니다.: %s", csv_path.name)
-            return
-
-        # stock_id에 해당하는 event들 가져오기
-        stock_events = event_map.get(stock_id, [])
-        now = _now()
-
-        # url컬럼 추출
-        urls = [row["_url"] for row in rows]
-        existing_url_ids = self._load_existing_url_ids(conn, urls)
-
-        news_rows: list[tuple] = []
-        seen_new_urls: set[str] = set()
-
-        for row in rows:
-            url = row["_url"]
-            # 잘못된 url, 이미 DB에 있는 url, 이번 for문에 나왔던 url은 생략
-            if not url or url in existing_url_ids or url in seen_new_urls:
-                continue
-
-            seen_new_urls.add(url)
-            news_rows.append(
-                (
-                    now,
-                    now,
-                    row.get("content", ""),
-                    row["_published_at"],
-                    row.get("source", ""),
-                    STATUS_ACTIVE,
-                    row.get("thumbnailUrl") or None,
-                    row.get("title", ""),
-                    url,
-                )
-            )
-
-        if news_rows:
-            inserted_news = self._bulk_insert_news(conn, news_rows)
-            url_to_id = {**existing_url_ids, **{url: news_id for url, news_id in inserted_news}}
-        else:
-            logger.info("  → 신규 뉴스 없음")
-            url_to_id = existing_url_ids
-
-        all_news_ids = list(url_to_id.values())
-        if not all_news_ids:
-            logger.info("  → 매핑 가능한 news_id 없음")
-            conn.commit()
-            return
-
-        existing_news_stock_pairs = self._load_existing_news_stock_pairs(conn, all_news_ids, stock_id)
-        existing_news_tag_pairs = self._load_existing_news_tag_pairs(conn, all_news_ids)
-
-        target_event_ids = [event["id"] for event in stock_events]
-        existing_event_news_pairs = self._load_existing_event_news_pairs(conn, all_news_ids, target_event_ids)
-
-        news_stocks_rows: list[tuple] = []
-        news_tags_rows: list[tuple] = []
-        event_news_rows: list[tuple] = []
-
-        total_ns, total_nt, total_en = 0, 0, 0
-
-        for row in rows:
-            url = row["_url"]
-            news_id = url_to_id.get(url)
-            if not news_id:
-                continue
-
-            # news - stock 쌍이 존재하지 않으면 추가
-            news_stock_pair = (news_id, stock_id)
-            if news_stock_pair not in existing_news_stock_pairs:
-                news_stocks_rows.append((now, now, STATUS_ACTIVE, news_id, stock_id))
-                existing_news_stock_pairs.add(news_stock_pair)
-
-            # news - tag 쌍이 존재하지 않으면 추가
-            for pred_col in ("pred_major", "pred_sub"):
-                tag_name = (row.get(pred_col) or "").strip()
-                if not tag_name:
-                    continue
-
-                tag_id = tag_map.get(tag_name)
-                if not tag_id:
-                    logger.debug("태그 미존재: '%s'", tag_name)
-                    continue
-
-                news_tag_pair = (news_id, tag_id)
-                if news_tag_pair not in existing_news_tag_pairs:
-                    news_tags_rows.append((now, now, STATUS_ACTIVE, news_id, tag_id))
-                    existing_news_tag_pairs.add(news_tag_pair)
-
-            published_date = row["_published_date"]
-
-            # 연관도 점수 추가
-            relevance_score = self._calc_relevance(row)
-
-            # 이벤트 기간에 해당하고, event-news 쌍이 존재하지 않으면 추가
-            for event in stock_events:
-                if event["start_date"] <= published_date <= event["end_date"]:
-                    event_news_pair = (event["id"], news_id)
-                    if event_news_pair not in existing_event_news_pairs:
-                        event_news_rows.append(
-                            (
-                                now,
-                                now,
-                                relevance_score,
-                                STATUS_ACTIVE,
-                                event["id"],
-                                news_id,
-                            )
-                        )
-                        existing_event_news_pairs.add(event_news_pair)
-
-            # 개수 쌓이면 insert
-            if (
-                len(news_stocks_rows) >= self.batch_size
-                or len(news_tags_rows) >= self.batch_size
-                or len(event_news_rows) >= self.batch_size
-            ):
-                self._bulk_insert_junction(conn, news_stocks_rows, news_tags_rows, event_news_rows)
-                total_ns += len(news_stocks_rows)
-                total_nt += len(news_tags_rows)
-                total_en += len(event_news_rows)
-                news_stocks_rows.clear()
-                news_tags_rows.clear()
-                event_news_rows.clear()
-
-        # 끝나고 남은 것들 insert
-        if news_stocks_rows or news_tags_rows or event_news_rows:
-            self._bulk_insert_junction(conn, news_stocks_rows, news_tags_rows, event_news_rows)
-            total_ns += len(news_stocks_rows)
-            total_nt += len(news_tags_rows)
-            total_en += len(event_news_rows)
-
-        conn.commit()
-
-        logger.info(
-            "  → news_new=%d, news_existing=%d, news_stocks=%d, news_tags=%d, event_news=%d",
-            len(news_rows),
-            len(existing_url_ids),
-            total_ns,
-            total_nt,
-            total_en,
-        )
+            row = cur.fetchone()
+            return row["id"] if row else None
 
     @staticmethod
-    def _read_csv(csv_path: Path) -> list[dict]:
-        rows: list[dict] = []
+    def _load_active_events_for_stock(conn, stock_id: int) -> list[dict]:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, start_date, end_date
+                FROM events
+                WHERE stock_id = %s
+                  AND status = 'ACTIVE'
+                ORDER BY start_date
+                """,
+                (stock_id,),
+            )
+            return list(cur.fetchall())
+
+    @staticmethod
+    def _load_tag_ids_for_names(conn, tag_names: set[str]) -> dict[str, int]:
+        if not tag_names:
+            return {}
+
+        with conn.cursor() as cur:
+            placeholders = ",".join(["%s"] * len(tag_names))
+            cur.execute(
+                f"""
+                SELECT id, name
+                FROM tags
+                WHERE status = 'ACTIVE'
+                  AND name IN ({placeholders})
+                """,
+                list(tag_names),
+            )
+            return {row["name"]: row["id"] for row in cur.fetchall()}
+
+    def _iter_csv_chunks(self, csv_path: Path) -> Iterator[list[dict]]:
+        chunk: list[dict] = []
+
         with open(csv_path, newline="", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
+
             for row in reader:
                 url = (row.get("url") or "").strip()
                 if not url:
@@ -293,139 +301,59 @@ class TransferService:
                 normalized["_url"] = url
                 normalized["_published_at"] = published_at
                 normalized["_published_date"] = published_date
-                rows.append(normalized)
-        return rows
+                chunk.append(normalized)
 
-    def _load_existing_url_ids(self, conn, urls: list[str]) -> dict[str, int]:
-        if not urls:
-            return {}
+                if len(chunk) >= self.batch_size:
+                    yield chunk
+                    chunk = []
 
-        result: dict[str, int] = {}
-        unique_urls = list(dict.fromkeys(urls))
+        if chunk:
+            yield chunk
 
-        with conn.cursor() as cur:
-            # 배치 사이즈 단위로 DB 적재
-            for i in range(0, len(unique_urls), self.batch_size):
-                chunk = unique_urls[i : i + self.batch_size]
-                placeholders = ",".join(["%s"] * len(chunk))
-                cur.execute(
-                    f"SELECT id, url FROM news WHERE url IN ({placeholders})",
-                    chunk,
-                )
-                for row in cur.fetchall():
-                    result[row["url"]] = row["id"]
-        return result
+    def _bulk_insert_news_ignore(self, conn, news_rows: list[tuple]) -> int:
+        if not news_rows:
+            return 0
 
-    def _load_existing_news_stock_pairs(
-        self,
-        conn,
-        news_ids: list[int],
-        stock_id: int,
-    ) -> set[tuple[int, int]]:
-        if not news_ids:
-            return set()
-
-        result: set[tuple[int, int]] = set()
-        with conn.cursor() as cur:
-            for i in range(0, len(news_ids), self.batch_size):
-                chunk = news_ids[i : i + self.batch_size]
-                placeholders = ",".join(["%s"] * len(chunk))
-                cur.execute(
-                    f"""
-                    SELECT news_id, stock_id
-                    FROM news_stocks
-                    WHERE stock_id = %s
-                      AND news_id IN ({placeholders})
-                    """,
-                    [stock_id, *chunk],
-                )
-                for row in cur.fetchall():
-                    result.add((row["news_id"], row["stock_id"]))
-        return result
-
-    def _load_existing_news_tag_pairs(
-        self,
-        conn,
-        news_ids: list[int],
-    ) -> set[tuple[int, int]]:
-        if not news_ids:
-            return set()
-
-        result: set[tuple[int, int]] = set()
-        with conn.cursor() as cur:
-            for i in range(0, len(news_ids), self.batch_size):
-                chunk = news_ids[i : i + self.batch_size]
-                placeholders = ",".join(["%s"] * len(chunk))
-                cur.execute(
-                    f"""
-                    SELECT news_id, tag_id
-                    FROM news_tags
-                    WHERE news_id IN ({placeholders})
-                    """,
-                    chunk,
-                )
-                for row in cur.fetchall():
-                    result.add((row["news_id"], row["tag_id"]))
-        return result
-
-    def _load_existing_event_news_pairs(
-        self,
-        conn,
-        news_ids: list[int],
-        event_ids: list[int],
-    ) -> set[tuple[int, int]]:
-        if not news_ids or not event_ids:
-            return set()
-
-        result: set[tuple[int, int]] = set()
-        with conn.cursor() as cur:
-            for ni in range(0, len(news_ids), self.batch_size):
-                news_chunk = news_ids[ni : ni + self.batch_size]
-                news_placeholders = ",".join(["%s"] * len(news_chunk))
-
-                for ei in range(0, len(event_ids), self.batch_size):
-                    event_chunk = event_ids[ei : ei + self.batch_size]
-                    event_placeholders = ",".join(["%s"] * len(event_chunk))
-
-                    # 이벤트-뉴스 쌍이 존재하면 가져오기
-                    cur.execute(
-                        f"""
-                        SELECT event_id, news_id
-                        FROM event_news
-                        WHERE news_id IN ({news_placeholders})
-                          AND event_id IN ({event_placeholders})
-                        """,
-                        [*news_chunk, *event_chunk],
-                    )
-                    for row in cur.fetchall():
-                        result.add((row["event_id"], row["news_id"]))
-        return result
-
-    def _bulk_insert_news(self, conn, news_rows: list[tuple]) -> list[tuple[str, int]]:
         insert_sql = """
-            INSERT INTO news
+            INSERT IGNORE INTO news
                 (created_at, updated_at, content, published_at,
                  source, status, thumbnail_url, title, url)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
-        inserted: list[tuple[str, int]] = []
+
+        inserted_count = 0
 
         with conn.cursor() as cur:
             for i in range(0, len(news_rows), self.batch_size):
                 batch = news_rows[i : i + self.batch_size]
-                cur.executemany(insert_sql, batch)
+                affected = cur.executemany(insert_sql, batch)
+                inserted_count += affected
 
-                #new테이블에 넣었던 url들 다시 조회해서 inserted 리스트에 (url, id) 형태로 저장
-                batch_urls = [row[8] for row in batch]
-                placeholders = ",".join(["%s"] * len(batch_urls))
+        return inserted_count
+
+    def _load_url_to_id_by_urls(self, conn, urls: list[str]) -> dict[str, int]:
+        if not urls:
+            return {}
+
+        unique_urls = list(dict.fromkeys(urls))
+        result: dict[str, int] = {}
+
+        with conn.cursor() as cur:
+            for i in range(0, len(unique_urls), self.batch_size):
+                chunk = unique_urls[i : i + self.batch_size]
+                placeholders = ",".join(["%s"] * len(chunk))
                 cur.execute(
-                    f"SELECT id, url FROM news WHERE url IN ({placeholders})",
-                    batch_urls,
+                    f"""
+                    SELECT id, url
+                    FROM news
+                    WHERE url IN ({placeholders})
+                    """,
+                    chunk,
                 )
                 for row in cur.fetchall():
-                    inserted.append((row["url"], row["id"]))
+                    result[row["url"]] = row["id"]
 
-        return inserted
+        return result
 
     def _bulk_insert_junction(
         self,
@@ -433,10 +361,14 @@ class TransferService:
         news_stocks_rows: list[tuple],
         news_tags_rows: list[tuple],
         event_news_rows: list[tuple],
-    ) -> None:
+    ) -> tuple[int, int, int]:
+        inserted_ns = 0
+        inserted_nt = 0
+        inserted_en = 0
+
         with conn.cursor() as cur:
             if news_stocks_rows:
-                cur.executemany(
+                inserted_ns = cur.executemany(
                     """
                     INSERT IGNORE INTO news_stocks
                         (created_at, updated_at, status, news_id, stock_id)
@@ -446,7 +378,7 @@ class TransferService:
                 )
 
             if news_tags_rows:
-                cur.executemany(
+                inserted_nt = cur.executemany(
                     """
                     INSERT IGNORE INTO news_tags
                         (created_at, updated_at, status, news_id, tag_id)
@@ -456,7 +388,7 @@ class TransferService:
                 )
 
             if event_news_rows:
-                cur.executemany(
+                inserted_en = cur.executemany(
                     """
                     INSERT IGNORE INTO event_news
                         (created_at, updated_at, relevance_score, status, event_id, news_id)
@@ -465,9 +397,10 @@ class TransferService:
                     event_news_rows,
                 )
 
+        return inserted_ns, inserted_nt, inserted_en
+
     @staticmethod
     def _calc_relevance(row: dict) -> float:
-        # TODO: 연관도 점수 기준 정한 후 개선 필요
         try:
             major = float(row.get("pred_major_prob") or 0)
             sub = float(row.get("pred_sub_prob") or 0)
