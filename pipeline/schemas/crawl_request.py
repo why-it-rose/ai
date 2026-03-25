@@ -3,6 +3,7 @@ from typing import List
 
 
 class CrawlPeriod(BaseModel):
+    event_id: int
     fromDate: str
     toDate: str
 
