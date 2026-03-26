@@ -17,7 +17,7 @@ class CrawlOrchestrator:
         crawled_file_paths = self.csv_service.write_stock_csv(response.stocks)
         tagged_file_paths = self.tag_service.tag_csv(crawled_file_paths)
         print(tagged_file_paths)
-        # self.transfer_service.transfer_all(tagged_file_paths)
+        self.transfer_service.transfer(tagged_file_paths, False)
 
         return {
             # "count": response.count,
@@ -46,7 +46,7 @@ class CrawlOrchestrator:
         logger.info("tag elapsed=%.3fs", time.perf_counter() - t)
 
         t = time.perf_counter()
-        self.transfer_service.transfer_all(tagged_file_paths)
+        self.transfer_service.transfer(tagged_file_paths)
         logger.info("db 적재 elapsed=%.3fs", time.perf_counter() - t)
 
         logger.info("pipeline total elapsed=%.3fs", time.perf_counter() - total_start)
