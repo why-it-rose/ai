@@ -13,7 +13,7 @@ async def crawl_news(background_tasks: BackgroundTasks):
     return {"message": "작업이 등록됐습니다."}
 
 @router.get("/crawl-today")
-async def crawl_news(background_tasks: BackgroundTasks):
+async def crawl_news_today(background_tasks: BackgroundTasks):
     background_tasks.add_task(run_crawl_job, True)
     return {"message": "오늘의 뉴스 작업이 등록됐습니다."}
 
