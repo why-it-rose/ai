@@ -13,9 +13,10 @@ class CrawlOrchestrator:
     async def run_today(self):
         request = self.request_generator.generate_today()
         print(request)
-        # response = await self.crawl_service.collect(request.targets)
-        # crawled_file_paths = self.csv_service.write_stock_csv(response.stocks)
-        # tagged_file_paths = self.tag_service.tag_csv(crawled_file_paths)
+        response = await self.crawl_service.collect(request.targets)
+        crawled_file_paths = self.csv_service.write_stock_csv(response.stocks)
+        tagged_file_paths = self.tag_service.tag_csv(crawled_file_paths)
+        print(tagged_file_paths)
         # self.transfer_service.transfer_all(tagged_file_paths)
 
         return {
