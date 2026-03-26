@@ -8,6 +8,8 @@ import pymysql
 import pymysql.cursors
 from dotenv import dotenv_values
 
+from pipeline.services.RelevanceScorer import RelevanceScorer
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -385,14 +387,11 @@ class TransferService:
 
         return inserted_ns, inserted_nt, inserted_en
 
+
     @staticmethod
     def _calc_relevance(row: dict) -> float:
-        try:
-            major = float(row.get("pred_major_prob") or 0)
-            sub = float(row.get("pred_sub_prob") or 0)
-            return round((major + sub) / 2, 4)
-        except (ValueError, TypeError):
-            return 0.0
+        return RelevanceScorer.calc_relevance(row)
+
 
     def _find_activatable_event_ids(self, conn, expected_event_urls: dict[int, set[str]]) -> list[int]:
         event_ids = list(expected_event_urls.keys())
