@@ -1,4 +1,5 @@
 from collections import defaultdict
+from datetime import date
 from pathlib import Path
 
 import pymysql
@@ -28,7 +29,8 @@ class RequestGenerator:
             autocommit=False,
         )
 
-    def generate(self) -> CrawlJobRequest:
+
+    def generate_entire(self) -> CrawlJobRequest:
         with self._connect() as conn:
             events = self._load_crawl_target_events(conn)
             event_ids = [row["event_id"] for row in events]
@@ -93,3 +95,45 @@ class RequestGenerator:
                 """,
                 event_ids,
             )
+
+    def generate_today(self) -> CrawlJobRequest:
+        today = date.today()
+
+        with self._connect() as conn:
+            stocks = self._load_today_target_stocks(conn)
+        print(f"오늘의 타겟 주식 수: {len(stocks)}")
+        return self._build_today_targets(stocks, today)
+
+    def _build_today_targets(
+        self,
+        stocks: list[dict],
+        target_date: date,
+    ) -> CrawlJobRequest:
+        date_str = target_date.strftime("%Y.%m.%d")
+
+        return CrawlJobRequest(
+            targets=[
+                CrawlTarget(
+                    stock=row["stock_name"],
+                    periods=[
+                        CrawlPeriod(
+                            fromDate=date_str,
+                            toDate=date_str,
+                        )
+                    ],
+                )
+                for row in stocks
+            ]
+        )
+
+    @staticmethod
+    def _load_today_target_stocks(conn) -> list[dict]:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT s.name AS stock_name
+                FROM stocks s
+                WHERE s.status = 'ACTIVE';
+                """
+            )
+            return list(cur.fetchall())

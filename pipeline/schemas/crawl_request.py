@@ -1,9 +1,9 @@
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 
 
 class CrawlPeriod(BaseModel):
-    event_id: int
+    event_id: Optional[int] = None
     fromDate: str
     toDate: str
 
