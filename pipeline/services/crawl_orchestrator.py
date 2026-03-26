@@ -17,7 +17,7 @@ class CrawlOrchestrator:
         crawled_file_paths = self.csv_service.write_stock_csv(response.stocks)
         tagged_file_paths = self.tag_service.tag_csv(crawled_file_paths)
         print(tagged_file_paths)
-        self.transfer_service.transfer(tagged_file_paths, False)
+        self.transfer_service.transfer(tagged_file_paths, link_events=False)
 
         return {
             # "count": response.count,
