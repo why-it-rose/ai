@@ -52,7 +52,7 @@ class TransferService:
         }
         self.batch_size = batch_size
 
-    def transfer_all(self, tagged_file_paths: list[str] | str) -> None:
+    def transfer(self, tagged_file_paths: list[str] | str, link_events: bool = True) -> None:
         if isinstance(tagged_file_paths, str):
             tagged_file_paths = [tagged_file_paths]
 
@@ -82,14 +82,14 @@ class TransferService:
                     logger.warning("stocks 테이블에 없는 종목입니다: %s", company_name)
                     continue
 
-                logger.info("처리 시작: %s (stock_id=%s)", csv_path.name, stock_id)
-                self._process_csv(conn, csv_path, stock_id)
+                logger.info("처리 시작: %s (stock_id=%s, link_events=%s)", csv_path.name, stock_id, link_events)
+                self._process_csv(conn, csv_path, stock_id, link_events=link_events)
                 logger.info("처리 완료: %s", csv_path.name)
 
     # 각 stock csv파일마다 진행
-    def _process_csv(self, conn, csv_path: Path, stock_id: int) -> None:
-        stock_events = self._load_pending_events_for_stock(conn, stock_id)
-        expected_event_urls = {event["id"]: set() for event in stock_events}
+    def _process_csv(self, conn, csv_path: Path, stock_id: int, *, link_events: bool = False) -> None:
+        stock_events = self._load_pending_events_for_stock(conn, stock_id) if link_events else []
+        expected_event_urls = {event["id"]: set() for event in stock_events} if link_events else {}
 
         total_news_new = 0
         total_news_link = 0
@@ -101,12 +101,12 @@ class TransferService:
             chunk_count += 1
             now = _now()
 
-            # 이벤트마다 연결된 뉴스 수
-            for row in rows:
-                published_date = row["_published_date"]
-                for event in stock_events:
-                    if event["start_date"] <= published_date <= event["end_date"]:
-                        expected_event_urls[event["id"]].add(row["_url"])
+            if link_events:
+                for row in rows:
+                    published_date = row["_published_date"]
+                    for event in stock_events:
+                        if event["start_date"] <= published_date <= event["end_date"]:
+                            expected_event_urls[event["id"]].add(row["_url"])
 
             tag_names = set()
             for row in rows:
@@ -175,7 +175,6 @@ class TransferService:
 
                     tag_id = tag_map.get(tag_name)
                     if not tag_id:
-                        logger.debug("태그 미존재: '%s'", tag_name)
                         continue
 
                     news_tag_pair = (news_id, tag_id)
@@ -183,24 +182,18 @@ class TransferService:
                         news_tags_rows.append((now, now, STATUS_ACTIVE, news_id, tag_id))
                         seen_news_tag_pairs.add(news_tag_pair)
 
-                published_date = row["_published_date"]
-                relevance_score = self._calc_relevance(row)
+                if link_events:
+                    published_date = row["_published_date"]
+                    relevance_score = self._calc_relevance(row)
 
-                for event in stock_events:
-                    if event["start_date"] <= published_date <= event["end_date"]:
-                        event_news_pair = (event["id"], news_id)
-                        if event_news_pair not in seen_event_news_pairs:
-                            event_news_rows.append(
-                                (
-                                    now,
-                                    now,
-                                    relevance_score,
-                                    STATUS_ACTIVE,
-                                    event["id"],
-                                    news_id,
+                    for event in stock_events:
+                        if event["start_date"] <= published_date <= event["end_date"]:
+                            event_news_pair = (event["id"], news_id)
+                            if event_news_pair not in seen_event_news_pairs:
+                                event_news_rows.append(
+                                    (now, now, relevance_score, STATUS_ACTIVE, event["id"], news_id)
                                 )
-                            )
-                            seen_event_news_pairs.add(event_news_pair)
+                                seen_event_news_pairs.add(event_news_pair)
 
             inserted_ns, inserted_nt, inserted_en = self._bulk_insert_junction(
                 conn,
@@ -212,30 +205,13 @@ class TransferService:
             total_news_link += inserted_ns
             total_tag_link += inserted_nt
             total_event_link += inserted_en
-
             conn.commit()
 
-            logger.info(
-                "  → chunk=%d news_new=%d, news_stocks=%d, news_tags=%d, event_news=%d",
-                chunk_count,
-                inserted_count,
-                inserted_ns,
-                inserted_nt,
-                inserted_en,
-            )
-
-        activatable_event_ids = self._find_activatable_event_ids(conn, expected_event_urls)
-        if activatable_event_ids:
-            self._mark_events_active(conn, activatable_event_ids)
-            conn.commit()
-
-        logger.info(
-            "  → total news_new=%d, news_stocks=%d, news_tags=%d, event_news=%d",
-            total_news_new,
-            total_news_link,
-            total_tag_link,
-            total_event_link,
-        )
+        if link_events:
+            activatable_event_ids = self._find_activatable_event_ids(conn, expected_event_urls)
+            if activatable_event_ids:
+                self._mark_events_active(conn, activatable_event_ids)
+                conn.commit()
 
     def _connect(self) -> pymysql.connections.Connection:
         return pymysql.connect(

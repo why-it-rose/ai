@@ -10,11 +10,27 @@ class CrawlOrchestrator:
         self.tag_service = tag_service
         self.transfer_service = transfer_service
 
-    async def run(self):
+    async def run_today(self):
+        request = self.request_generator.generate_today()
+        print(request)
+        response = await self.crawl_service.collect(request.targets)
+        crawled_file_paths = self.csv_service.write_stock_csv(response.stocks)
+        tagged_file_paths = self.tag_service.tag_csv(crawled_file_paths)
+        print(tagged_file_paths)
+        self.transfer_service.transfer(tagged_file_paths, link_events=False)
+
+        return {
+            # "count": response.count,
+            # "stocks": response.stocks,
+            # "file_path": crawled_file_paths,
+            # "tagged_file_paths": tagged_file_paths,
+        }
+
+    async def run_entire(self):
         total_start = time.perf_counter()
 
         t = time.perf_counter()
-        request = self.request_generator.generate()
+        request = self.request_generator.generate_entire()
         logger.info("request 생성 elapsed=%.3fs", time.perf_counter() - t)
 
         t = time.perf_counter()
@@ -30,7 +46,7 @@ class CrawlOrchestrator:
         logger.info("tag elapsed=%.3fs", time.perf_counter() - t)
 
         t = time.perf_counter()
-        self.transfer_service.transfer_all(tagged_file_paths)
+        self.transfer_service.transfer(tagged_file_paths)
         logger.info("db 적재 elapsed=%.3fs", time.perf_counter() - t)
 
         logger.info("pipeline total elapsed=%.3fs", time.perf_counter() - total_start)
