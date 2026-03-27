@@ -1,5 +1,5 @@
 from collections import defaultdict
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pymysql
@@ -48,8 +48,8 @@ class RequestGenerator:
             grouped[row["stock_name"]].append(
                 CrawlPeriod(
                     event_id=row["event_id"],
-                    fromDate=row["start_date"].strftime("%Y.%m.%d"),
-                    toDate=row["end_date"].strftime("%Y.%m.%d"),
+                    fromDate=(row["start_date"] - timedelta(days=1)).strftime("%Y.%m.%d"),
+                    toDate=(row["end_date"] + timedelta(days=1)).strftime("%Y.%m.%d"),
                 )
             )
 
