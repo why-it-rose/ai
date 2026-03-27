@@ -1,6 +1,6 @@
 import csv
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Iterator
 
@@ -8,7 +8,7 @@ import pymysql
 import pymysql.cursors
 from dotenv import dotenv_values
 
-from pipeline.services.RelevanceScorer import RelevanceScorer
+from pipeline.services.event_news_relevance_service import EventNewsRelevanceService
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -23,11 +23,11 @@ def _now() -> str:
 
 def _parse_dt(value: str) -> str:
     for fmt in (
-            "%Y-%m-%dT%H:%M:%S%z",
-            "%Y-%m-%dT%H:%M:%S.%f%z",
-            "%Y-%m-%d %H:%M:%S",
-            "%Y-%m-%d %H:%M:%S.%f",
-            "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S.%f%z",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%dT%H:%M:%S",
     ):
         try:
             dt = datetime.strptime(value.strip(), fmt)
@@ -53,6 +53,7 @@ class TransferService:
             "charset": env.get("DB_CHARSET", "utf8mb4"),
         }
         self.batch_size = batch_size
+        self.relevance_service = EventNewsRelevanceService()
 
     def transfer(self, tagged_file_paths: list[str] | str, link_events: bool = True) -> None:
         if isinstance(tagged_file_paths, str):
@@ -88,7 +89,6 @@ class TransferService:
                 self._process_csv(conn, csv_path, stock_id, link_events=link_events)
                 logger.info("처리 완료: %s", csv_path.name)
 
-    # 각 stock csv파일마다 진행
     def _process_csv(self, conn, csv_path: Path, stock_id: int, *, link_events: bool = False) -> None:
         stock_events = self._load_pending_events_for_stock(conn, stock_id) if link_events else []
         expected_event_urls = {event["id"]: set() for event in stock_events} if link_events else {}
@@ -107,7 +107,10 @@ class TransferService:
                 for row in rows:
                     published_date = row["_published_date"]
                     for event in stock_events:
-                        if event["start_date"] <= published_date <= event["end_date"]:
+                        window_start = event["start_date"] - timedelta(days=1)
+                        window_end = event["end_date"] + timedelta(days=1)
+
+                        if window_start <= published_date <= window_end:
                             expected_event_urls[event["id"]].add(row["_url"])
 
             tag_names = set()
@@ -139,6 +142,7 @@ class TransferService:
                         row.get("thumbnailUrl") or None,
                         row.get("title", ""),
                         url,
+                        row.get("sentiment_score",) or None
                     )
                 )
 
@@ -186,16 +190,22 @@ class TransferService:
 
                 if link_events:
                     published_date = row["_published_date"]
-                    relevance_score = self._calc_relevance(row)
 
                     for event in stock_events:
-                        if event["start_date"] <= published_date <= event["end_date"]:
-                            event_news_pair = (event["id"], news_id)
-                            if event_news_pair not in seen_event_news_pairs:
-                                event_news_rows.append(
-                                    (now, now, relevance_score, STATUS_ACTIVE, event["id"], news_id)
-                                )
-                                seen_event_news_pairs.add(event_news_pair)
+                        window_start = event["start_date"] - timedelta(days=1)
+                        window_end = event["end_date"] + timedelta(days=1)
+
+                        if not (window_start <= published_date <= window_end):
+                            continue
+
+                        relevance_score = self.relevance_service.calculate(row, event)
+
+                        event_news_pair = (event["id"], news_id)
+                        if event_news_pair not in seen_event_news_pairs:
+                            event_news_rows.append(
+                                (now, now, relevance_score, STATUS_ACTIVE, event["id"], news_id)
+                            )
+                            seen_event_news_pairs.add(event_news_pair)
 
             inserted_ns, inserted_nt, inserted_en = self._bulk_insert_junction(
                 conn,
@@ -214,6 +224,15 @@ class TransferService:
             if activatable_event_ids:
                 self._mark_events_active(conn, activatable_event_ids)
                 conn.commit()
+
+        logger.info(
+            "csv=%s, new_news=%d, stock_links=%d, tag_links=%d, event_links=%d",
+            csv_path.name,
+            total_news_new,
+            total_news_link,
+            total_tag_link,
+            total_event_link,
+        )
 
     def _connect(self) -> pymysql.connections.Connection:
         return pymysql.connect(
@@ -243,7 +262,7 @@ class TransferService:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, start_date, end_date
+                SELECT id, event_type, start_date, end_date
                 FROM events
                 WHERE stock_id = %s
                   AND crawl_status = 'PENDING'
@@ -258,8 +277,8 @@ class TransferService:
         if not tag_names:
             return {}
 
+        placeholders = ",".join(["%s"] * len(tag_names))
         with conn.cursor() as cur:
-            placeholders = ",".join(["%s"] * len(tag_names))
             cur.execute(
                 f"""
                 SELECT id, name
@@ -274,21 +293,10 @@ class TransferService:
     def _iter_csv_chunks(self, csv_path: Path) -> Iterator[list[dict]]:
         chunk: list[dict] = []
 
-        with open(csv_path, newline="", encoding="utf-8-sig") as f:
+        with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
             reader = csv.DictReader(f)
-
-            for row in reader:
-                url = (row.get("url") or "").strip()
-                if not url:
-                    continue
-
-                published_at = _parse_dt(row["publishedAt"])
-                published_date = datetime.strptime(published_at, NOW_FMT).date()
-
-                normalized = dict(row)
-                normalized["_url"] = url
-                normalized["_published_at"] = published_at
-                normalized["_published_date"] = published_date
+            for raw in reader:
+                normalized = self._normalize_csv_row(raw)
                 chunk.append(normalized)
 
                 if len(chunk) >= self.batch_size:
@@ -298,6 +306,27 @@ class TransferService:
         if chunk:
             yield chunk
 
+    @staticmethod
+    def _normalize_csv_row(row: dict) -> dict:
+        url = (row.get("url") or "").strip()
+        published_at_raw = (row.get("publishedAt") or row.get("published_at") or "").strip()
+        published_at = _parse_dt(published_at_raw)
+        published_date = datetime.strptime(published_at, NOW_FMT).date()
+
+        sentiment_raw = row.get("sentiment_score")
+        try:
+            sentiment_score = float(sentiment_raw) if sentiment_raw not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            sentiment_score = 0.0
+
+        return {
+            **row,
+            "sentiment_score": sentiment_score,
+            "_url": url,
+            "_published_at": published_at,
+            "_published_date": published_date,
+        }
+
     def _bulk_insert_news_ignore(self, conn, news_rows: list[tuple]) -> int:
         if not news_rows:
             return 0
@@ -305,8 +334,8 @@ class TransferService:
         insert_sql = """
             INSERT IGNORE INTO news
                 (created_at, updated_at, content, published_at,
-                 source, status, thumbnail_url, title, url)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 source, status, thumbnail_url, title, url, sentiment_score)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
 
         inserted_count = 0
@@ -344,11 +373,11 @@ class TransferService:
         return result
 
     def _bulk_insert_junction(
-            self,
-            conn,
-            news_stocks_rows: list[tuple],
-            news_tags_rows: list[tuple],
-            event_news_rows: list[tuple],
+        self,
+        conn,
+        news_stocks_rows: list[tuple],
+        news_tags_rows: list[tuple],
+        event_news_rows: list[tuple],
     ) -> tuple[int, int, int]:
         inserted_ns = 0
         inserted_nt = 0
@@ -386,12 +415,6 @@ class TransferService:
                 )
 
         return inserted_ns, inserted_nt, inserted_en
-
-
-    @staticmethod
-    def _calc_relevance(row: dict) -> float:
-        return RelevanceScorer.calc_relevance(row)
-
 
     def _find_activatable_event_ids(self, conn, expected_event_urls: dict[int, set[str]]) -> list[int]:
         event_ids = list(expected_event_urls.keys())
