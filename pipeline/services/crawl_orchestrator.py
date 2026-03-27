@@ -2,13 +2,17 @@ import logging
 import time
 
 logger = logging.getLogger(__name__)
+
+
 class CrawlOrchestrator:
-    def __init__(self, request_generator, crawl_service, csv_service, tag_service, transfer_service):
+    def __init__(self, request_generator, crawl_service, csv_service, tag_service, transfer_service,
+                 sentiment_predictor):
         self.request_generator = request_generator
         self.crawl_service = crawl_service
         self.csv_service = csv_service
         self.tag_service = tag_service
         self.transfer_service = transfer_service
+        self.sentiment_predictor = sentiment_predictor
 
     async def run_today(self):
         request = self.request_generator.generate_today()
@@ -46,9 +50,13 @@ class CrawlOrchestrator:
         logger.info("tag elapsed=%.3fs", time.perf_counter() - t)
 
         t = time.perf_counter()
-        self.transfer_service.transfer(tagged_file_paths)
-        logger.info("db 적재 elapsed=%.3fs", time.perf_counter() - t)
+        ready_paths = self.sentiment_predictor.fill_missing_sentiment_scores(tagged_file_paths)
+        logger.info("긍/부정 예측 elapsed=%.3fs", time.perf_counter() - t)
+        print("ready_paths: ",ready_paths)
 
+        t = time.perf_counter()
+        self.transfer_service.transfer(ready_paths, link_events=True)
+        logger.info("db 적재 elapsed=%.3fs", time.perf_counter() - t)
         logger.info("pipeline total elapsed=%.3fs", time.perf_counter() - total_start)
         return {
             "count": response.count,
