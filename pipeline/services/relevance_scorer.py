@@ -7,41 +7,42 @@ from typing import Any
 
 @dataclass(frozen=True)
 class RelevanceConfig:
-    # 1) 감정 점수
-    SENTIMENT_BASE: float = 0.30
-    SENTIMENT_MULTIPLIER: float = 0.70
-    SENTIMENT_FLOOR: float = 0.05
-
-    # 2) 날짜 가중치
+    # 1) 날짜 가중치
     SURGE_IN_EVENT_WEIGHT: float = 1.00
-    SURGE_PRE1_WEIGHT: float = 0.12
-    SURGE_POST1_WEIGHT: float = 0.12
+    SURGE_PRE1_WEIGHT: float = 0.70
+    SURGE_POST1_WEIGHT: float = 0.45
 
     DROP_IN_EVENT_WEIGHT: float = 1.00
-    DROP_PRE1_WEIGHT: float = 0.10
-    DROP_POST1_WEIGHT: float = 0.03
+    DROP_PRE1_WEIGHT: float = 0.70
+    DROP_POST1_WEIGHT: float = 1.00
 
-    # 3) 태그 가중치 fallback
-    DEFAULT_TAG_WEIGHT: float = 1.00
+    # 2) 태그 가중치
+    DEFAULT_TAG_WEIGHT: float = 0.75
+
+    # 3) 감성 보정치
+    SENTIMENT_ADJUST_BASE: float = 1.00
+    SENTIMENT_ADJUST_MULTIPLIER: float = 0.40
+    SENTIMENT_ADJUST_MIN: float = 0.70
+    SENTIMENT_ADJUST_MAX: float = 1.30
 
     # 4) 최종 점수 범위
     MIN_SCORE: float = 0.0
-    MAX_SCORE: float = 2.0
+    MAX_SCORE: float = 1.5
 
 
 class RelevanceScorer:
     CONFIG = RelevanceConfig()
 
     CATEGORY_WEIGHTS = {
-        ("기업", "실적"): 1.30,
-        ("기업", "제품"): 1.00,
-        ("기업", "투자"): 1.15,
-        ("기업", "재편"): 1.20,
+        ("기업", "실적"): 1.35,
+        ("기업", "재편"): 1.25,
+        ("기업", "투자"): 1.20,
         ("기업", "주주"): 1.15,
+        ("기업", "제품"): 1.00,
         ("시장", "수요"): 1.15,
         ("시장", "공급"): 1.10,
-        ("시장", "비용"): 0.95,
-        ("시장", "경쟁"): 0.90,
+        ("시장", "비용"): 0.90,
+        ("시장", "경쟁"): 0.85,
     }
 
     @classmethod
@@ -65,36 +66,51 @@ class RelevanceScorer:
         pred_major = (pred_major or "").strip()
         pred_sub = (pred_sub or "").strip()
 
-        sentiment_component = cls._calc_sentiment_component(event_type, sentiment_score)
         date_weight = cls._calc_date_weight(
             event_type=event_type,
             event_start_date=event_start_date,
             event_end_date=event_end_date,
             published_date=published_date,
         )
+        if date_weight <= 0.0:
+            return 0.0
+
         tag_weight = cls.CATEGORY_WEIGHTS.get(
             (pred_major, pred_sub),
             cls.CONFIG.DEFAULT_TAG_WEIGHT,
         )
 
-        score = sentiment_component * date_weight * tag_weight
+        sentiment_adjust = cls._calc_sentiment_adjust(
+            event_type=event_type,
+            sentiment_score=sentiment_score,
+        )
+
+        score = date_weight * tag_weight * sentiment_adjust
         return cls._clamp(score, cls.CONFIG.MIN_SCORE, cls.CONFIG.MAX_SCORE)
 
     @classmethod
-    def _calc_sentiment_component(cls, event_type: str, sentiment_score: float) -> float:
+    def _calc_sentiment_adjust(cls, event_type: str, sentiment_score: float) -> float:
         direction = 1.0 if event_type == "SURGE" else -1.0
         directional_sentiment = sentiment_score * direction
-        score = cls.CONFIG.SENTIMENT_BASE + (directional_sentiment * cls.CONFIG.SENTIMENT_MULTIPLIER)
-        return max(cls.CONFIG.SENTIMENT_FLOOR, score)
+
+        adjust = (
+                cls.CONFIG.SENTIMENT_ADJUST_BASE
+                + (directional_sentiment * cls.CONFIG.SENTIMENT_ADJUST_MULTIPLIER)
+        )
+        return cls._clamp(
+            adjust,
+            cls.CONFIG.SENTIMENT_ADJUST_MIN,
+            cls.CONFIG.SENTIMENT_ADJUST_MAX,
+        )
 
     @classmethod
     def _calc_date_weight(
-        cls,
-        *,
-        event_type: str,
-        event_start_date: date,
-        event_end_date: date,
-        published_date: date,
+            cls,
+            *,
+            event_type: str,
+            event_start_date: date,
+            event_end_date: date,
+            published_date: date,
     ) -> float:
         if event_start_date <= published_date <= event_end_date:
             return (
