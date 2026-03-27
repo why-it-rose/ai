@@ -29,16 +29,10 @@ class RequestGenerator:
             autocommit=False,
         )
 
-
     def generate_entire(self) -> CrawlJobRequest:
         with self._connect() as conn:
             events = self._load_crawl_target_events(conn)
-            event_ids = [row["event_id"] for row in events]
-
-            if event_ids:
-                self._mark_events_pending(conn, event_ids)
-                conn.commit()
-
+            conn.commit()
             return self.build_targets(events)
 
     def build_targets(self, rows: list[dict]) -> CrawlJobRequest:
@@ -57,9 +51,9 @@ class RequestGenerator:
             targets=[
                 CrawlTarget(
                     stock=stock,
-                    periods=periods,
+                    periods=sorted(periods, key=lambda x: (x.fromDate, x.toDate, x.event_id or 0)),
                 )
-                for stock, periods in grouped.items()
+                for stock, periods in sorted(grouped.items(), key=lambda x: x[0])
             ]
         )
 
@@ -75,32 +69,136 @@ class RequestGenerator:
                     e.end_date
                 FROM events e
                 JOIN stocks s ON s.id = e.stock_id
-                WHERE e.crawl_status = 'INACTIVE';
+                WHERE e.crawl_status = 'INACTIVE'
+                  AND e.status = 'ACTIVE';
                 """
             )
             return list(cur.fetchall())
 
-    @staticmethod
-    def _mark_events_pending(conn, event_ids: list[int]) -> None:
-        if not event_ids:
+    def try_mark_event_pending(self, event_id: int) -> bool:
+        if event_id is None:
+            return True
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                affected = cur.execute(
+                    """
+                    UPDATE events
+                    SET crawl_status = 'PENDING'
+                    WHERE id = %s
+                      AND crawl_status = 'INACTIVE'
+                      AND status = 'ACTIVE'
+                    """,
+                    (event_id,),
+                )
+            conn.commit()
+            return affected > 0
+
+    def rollback_event_to_inactive(self, event_id: int) -> None:
+        if event_id is None:
             return
 
-        placeholders = ", ".join(["%s"] * len(event_ids))
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                UPDATE events
-                SET crawl_status = 'PENDING'
-                WHERE id IN ({placeholders});
-                """,
-                event_ids,
-            )
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE events
+                    SET crawl_status = 'INACTIVE'
+                    WHERE id = %s
+                      AND crawl_status = 'PENDING'
+                    """,
+                    (event_id,),
+                )
+            conn.commit()
+
+    def mark_event_active(self, event_id: int) -> None:
+        if event_id is None:
+            return
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE events
+                    SET crawl_status = 'ACTIVE'
+                    WHERE id = %s
+                      AND crawl_status = 'PENDING'
+                    """,
+                    (event_id,),
+                )
+            conn.commit()
+
+    def recover_pending_event(self, event_id: int) -> None:
+        if event_id is None:
+            return
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT EXISTS(
+                        SELECT 1
+                        FROM event_news
+                        WHERE event_id = %s
+                    ) AS has_event_news
+                    """,
+                    (event_id,),
+                )
+                row = cur.fetchone()
+                has_event_news = bool(row and row["has_event_news"])
+
+                if has_event_news:
+                    cur.execute(
+                        """
+                        UPDATE events
+                        SET crawl_status = 'ACTIVE'
+                        WHERE id = %s
+                          AND crawl_status = 'PENDING'
+                        """,
+                        (event_id,),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE events
+                        SET crawl_status = 'INACTIVE'
+                        WHERE id = %s
+                          AND crawl_status = 'PENDING'
+                        """,
+                        (event_id,),
+                    )
+
+            conn.commit()
+
+    def repair_pending_events(self) -> int:
+        repaired = 0
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM events
+                    WHERE crawl_status = 'PENDING'
+                      AND status = 'ACTIVE'
+                    """
+                )
+                pending_ids = [row["id"] for row in cur.fetchall()]
+
+            conn.commit()
+
+        for event_id in pending_ids:
+            self.recover_pending_event(event_id)
+            repaired += 1
+
+        return repaired
 
     def generate_today(self) -> CrawlJobRequest:
         today = date.today()
 
         with self._connect() as conn:
             stocks = self._load_today_target_stocks(conn)
+
         print(f"오늘의 타겟 주식 수: {len(stocks)}")
         return self._build_today_targets(stocks, today)
 

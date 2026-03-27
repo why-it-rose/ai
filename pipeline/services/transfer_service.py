@@ -1,6 +1,6 @@
 import csv
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from pathlib import Path
 from typing import Iterator
 
@@ -78,40 +78,55 @@ class TransferService:
 
         with self._connect() as conn:
             for csv_path in exists_files:
-                company_name = csv_path.stem
-                stock_id = self._resolve_stock_id(conn, company_name)
-
-                if stock_id is None:
-                    logger.warning("stocks 테이블에 없는 종목입니다: %s", company_name)
-                    continue
-
-                logger.info("처리 시작: %s (stock_id=%s, link_events=%s)", csv_path.name, stock_id, link_events)
-                self._process_csv(conn, csv_path, stock_id, link_events=link_events)
+                logger.info("처리 시작: %s (link_events=%s)", csv_path.name, link_events)
+                self._process_csv(conn, csv_path, link_events=link_events)
                 logger.info("처리 완료: %s", csv_path.name)
 
-    def _process_csv(self, conn, csv_path: Path, stock_id: int, *, link_events: bool = False) -> None:
-        stock_events = self._load_pending_events_for_stock(conn, stock_id) if link_events else []
-        expected_event_urls = {event["id"]: set() for event in stock_events} if link_events else {}
-
+    def _process_csv(self, conn, csv_path: Path, *, link_events: bool = False) -> None:
         total_news_new = 0
         total_news_link = 0
         total_tag_link = 0
         total_event_link = 0
         chunk_count = 0
 
+        event_map_cache: dict[int, dict] = {}
+        expected_event_urls: dict[int, set[str]] = {}
+
         for rows in self._iter_csv_chunks(csv_path):
+            if not rows:
+                continue
+
             chunk_count += 1
             now = _now()
 
-            if link_events:
-                for row in rows:
-                    published_date = row["_published_date"]
-                    for event in stock_events:
-                        window_start = event["start_date"] - timedelta(days=1)
-                        window_end = event["end_date"] + timedelta(days=1)
+            stock_name = rows[0]["_stock_name"]
+            stock_id = self._resolve_stock_id(conn, stock_name)
+            if stock_id is None:
+                logger.warning("stocks 테이블에 없는 종목입니다: %s", stock_name)
+                return
 
-                        if window_start <= published_date <= window_end:
-                            expected_event_urls[event["id"]].add(row["_url"])
+            if link_events:
+                event_ids = {row["_event_id"] for row in rows if row["_event_id"] is not None}
+                for event_id in event_ids:
+                    if event_id not in event_map_cache:
+                        event = self._load_pending_event_by_id(conn, event_id, stock_id)
+                        if event:
+                            event_map_cache[event_id] = event
+                            expected_event_urls.setdefault(event_id, set())
+
+                for row in rows:
+                    event_id = row["_event_id"]
+                    if event_id is None:
+                        continue
+                    event = event_map_cache.get(event_id)
+                    if not event:
+                        continue
+
+                    window_start = event["start_date"] - timedelta(days=1)
+                    window_end = event["end_date"] + timedelta(days=1)
+
+                    if window_start <= row["_published_date"] <= window_end:
+                        expected_event_urls[event_id].add(row["_url"])
 
             tag_names = set()
             for row in rows:
@@ -127,7 +142,7 @@ class TransferService:
 
             for row in rows:
                 url = row["_url"]
-                if url in seen_chunk_urls:
+                if not url or url in seen_chunk_urls:
                     continue
 
                 seen_chunk_urls.add(url)
@@ -142,7 +157,7 @@ class TransferService:
                         row.get("thumbnailUrl") or None,
                         row.get("title", ""),
                         url,
-                        row.get("sentiment_score",) or None
+                        row.get("sentiment_score") or None,
                     )
                 )
 
@@ -188,24 +203,25 @@ class TransferService:
                         news_tags_rows.append((now, now, STATUS_ACTIVE, news_id, tag_id))
                         seen_news_tag_pairs.add(news_tag_pair)
 
-                if link_events:
-                    published_date = row["_published_date"]
+                if link_events and row["_event_id"] is not None:
+                    event = event_map_cache.get(row["_event_id"])
+                    if not event:
+                        continue
 
-                    for event in stock_events:
-                        window_start = event["start_date"] - timedelta(days=1)
-                        window_end = event["end_date"] + timedelta(days=1)
+                    window_start = event["start_date"] - timedelta(days=1)
+                    window_end = event["end_date"] + timedelta(days=1)
 
-                        if not (window_start <= published_date <= window_end):
-                            continue
+                    if not (window_start <= row["_published_date"] <= window_end):
+                        continue
 
-                        relevance_score = self.relevance_service.calculate(row, event)
+                    relevance_score = self.relevance_service.calculate(row, event)
 
-                        event_news_pair = (event["id"], news_id)
-                        if event_news_pair not in seen_event_news_pairs:
-                            event_news_rows.append(
-                                (now, now, relevance_score, STATUS_ACTIVE, event["id"], news_id)
-                            )
-                            seen_event_news_pairs.add(event_news_pair)
+                    event_news_pair = (event["id"], news_id)
+                    if event_news_pair not in seen_event_news_pairs:
+                        event_news_rows.append(
+                            (now, now, relevance_score, STATUS_ACTIVE, event["id"], news_id)
+                        )
+                        seen_event_news_pairs.add(event_news_pair)
 
             inserted_ns, inserted_nt, inserted_en = self._bulk_insert_junction(
                 conn,
@@ -219,7 +235,7 @@ class TransferService:
             total_event_link += inserted_en
             conn.commit()
 
-        if link_events:
+        if link_events and expected_event_urls:
             activatable_event_ids = self._find_activatable_event_ids(conn, expected_event_urls)
             if activatable_event_ids:
                 self._mark_events_active(conn, activatable_event_ids)
@@ -258,19 +274,20 @@ class TransferService:
             return row["id"] if row else None
 
     @staticmethod
-    def _load_pending_events_for_stock(conn, stock_id: int) -> list[dict]:
+    def _load_pending_event_by_id(conn, event_id: int, stock_id: int) -> dict | None:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT id, event_type, start_date, end_date
                 FROM events
-                WHERE stock_id = %s
+                WHERE id = %s
+                  AND stock_id = %s
                   AND crawl_status = 'PENDING'
-                ORDER BY start_date
+                LIMIT 1
                 """,
-                (stock_id,),
+                (event_id, stock_id),
             )
-            return list(cur.fetchall())
+            return cur.fetchone()
 
     @staticmethod
     def _load_tag_ids_for_names(conn, tag_names: set[str]) -> dict[str, int]:
@@ -309,9 +326,17 @@ class TransferService:
     @staticmethod
     def _normalize_csv_row(row: dict) -> dict:
         url = (row.get("url") or "").strip()
+        stock_name = (row.get("stock_name") or "").strip()
+
         published_at_raw = (row.get("publishedAt") or row.get("published_at") or "").strip()
         published_at = _parse_dt(published_at_raw)
         published_date = datetime.strptime(published_at, NOW_FMT).date()
+
+        event_id_raw = row.get("event_id")
+        try:
+            event_id = int(event_id_raw) if event_id_raw not in (None, "", "nan") else None
+        except (TypeError, ValueError):
+            event_id = None
 
         sentiment_raw = row.get("sentiment_score")
         try:
@@ -323,6 +348,8 @@ class TransferService:
             **row,
             "sentiment_score": sentiment_score,
             "_url": url,
+            "_stock_name": stock_name,
+            "_event_id": event_id,
             "_published_at": published_at,
             "_published_date": published_date,
         }

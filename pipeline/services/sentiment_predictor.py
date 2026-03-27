@@ -171,7 +171,9 @@ class NewsSentimentService:
     def _write_csv_rows(self, output_path: Path, rows: list[dict], fieldnames: list[str]) -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with output_path.open("w", encoding="utf-8-sig", newline="") as f:
+        temp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+
+        with temp_path.open("w", encoding="utf-8-sig", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
 
@@ -179,10 +181,11 @@ class NewsSentimentService:
                 safe_row = {field: row.get(field, "") for field in fieldnames}
                 writer.writerow(safe_row)
 
-    def _build_output_path(self, input_path: Path) -> Path:
-        if self.output_dir:
-            return self.output_dir / input_path.name
-        return input_path
+        temp_path.replace(output_path)
+
+    def _build_output_path(self, input_path: Path | str) -> Path:
+        input_path = Path(input_path)
+        return self.output_dir / input_path.name
 
     @staticmethod
     def _build_fieldnames(rows: list[dict], original_fieldnames: list[str]) -> list[str]:
