@@ -2,6 +2,7 @@ from pipeline.services.crawl_orchestrator import CrawlOrchestrator
 from pipeline.services.crawl_service import CrawlService
 from pipeline.services.csv_service import CsvService
 from pipeline.services.request_generator import RequestGenerator
+from pipeline.services.summarize_service import SummaryService
 from pipeline.services.tag_service import TagService
 from pipeline.services.transfer_service import TransferService
 from dotenv import dotenv_values
@@ -13,6 +14,14 @@ crawl_service = CrawlService()
 csv_service = CsvService()
 tag_service = TagService()
 transfer_service = TransferService(batch_size=500)
+
+service = SummaryService(
+    eval_candidate_limit=30,  # 이벤트당 상위 30개만 재평가
+    eval_chunk_size=10,  # 10개씩 나눠서 평가
+    summary_news_limit=12,  # 최종 summary는 상위 12개 사용
+    content_char_limit=2200,  # 기사당 본문 최대 2200자
+    min_score_threshold_for_summary=0.15,  # 올리면 더 빡세게
+)
 
 crawl_orchestrator = CrawlOrchestrator(
     request_generator=request_generator,
