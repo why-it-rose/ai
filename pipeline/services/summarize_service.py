@@ -57,6 +57,7 @@ class SummaryService:
     def summarize_events(
         self,
         event_ids: list[int] | None = None,
+        stock_ids: list[int] | None = None,
         only_empty_summary: bool = True,
         only_active_crawl: bool = True,
         overwrite_existing_summary: bool = False,
@@ -73,6 +74,7 @@ class SummaryService:
             events = self._load_target_events(
                 conn=conn,
                 event_ids=event_ids,
+                stock_ids=stock_ids,
                 only_empty_summary=only_empty_summary if not overwrite_existing_summary else False,
                 only_active_crawl=only_active_crawl,
             )
@@ -94,15 +96,7 @@ class SummaryService:
                 )
 
                 if not candidate_news:
-                    logger.info("event_id=%s 연결된 뉴스가 없습니다.", event_id)
-
-                    if overwrite_existing_summary or only_empty_summary:
-                        self._update_event_summary(
-                            conn,
-                            event_id,
-                            "주가 변동의 직접 원인으로 볼 만한 핵심 뉴스가 확인되지 않았다."
-                        )
-                        conn.commit()
+                    logger.info("event_id=%s 연결된 뉴스가 없어 이벤트 요약을 생략합니다.", event_id)
                     continue
 
                 # 1) 뉴스별 LLM 재평가
@@ -139,6 +133,7 @@ class SummaryService:
     def _load_target_events(
         conn,
         event_ids: list[int] | None = None,
+        stock_ids: list[int] | None = None,
         only_empty_summary: bool = True,
         only_active_crawl: bool = True,
     ) -> list[dict]:
@@ -155,6 +150,11 @@ class SummaryService:
             placeholders = ",".join(["%s"] * len(event_ids))
             conditions.append(f"id IN ({placeholders})")
             params.extend(event_ids)
+
+        if stock_ids:
+            placeholders = ",".join(["%s"] * len(stock_ids))
+            conditions.append(f"stock_id IN ({placeholders})")
+            params.extend(stock_ids)
 
         where_sql = " AND ".join(conditions)
 
