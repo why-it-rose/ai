@@ -308,7 +308,11 @@ class TagService:
                 base_df.at[idx, "pred_sub_prob"] = float(result["pred_sub_prob"])
 
             base_df = ensure_output_columns(base_df)
-            base_df.to_csv(output_csv_path, index=False, encoding="utf-8-sig")
+
+            temp_output_path = output_csv_path + ".tmp"
+            base_df.to_csv(temp_output_path, index=False, encoding="utf-8-sig")
+            os.replace(temp_output_path, output_csv_path)
+
             print(f"예측 결과 저장 완료: {output_csv_path}")
 
         return output_csv_paths
