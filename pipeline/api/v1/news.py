@@ -48,33 +48,48 @@ async def run_crawl_job(is_today: bool = False):
         logger.exception("크롤링 작업 실패: %s", e)
 
 async def run_summary_job_all():
-    service.summarize_events(
-        event_ids=None,
-        stock_ids=None,
-        only_empty_summary=True,
-        only_active_crawl=True,
-        overwrite_existing_summary=False,
-        update_relevance_scores=True,
-    )
+    try:
+        logger.info("이벤트 요약 작업 시작 (모든 이벤트)")
+        service.summarize_events(
+            event_ids=None,
+            stock_ids=None,
+            only_empty_summary=True,
+            only_active_crawl=True,
+            overwrite_existing_summary=False,
+            update_relevance_scores=True,
+        )
+        logger.info("이벤트 요약 작업 완료")
+    except Exception as e:
+        logger.exception("이벤트 요약 작업 실패: %s", e)
 
 
 async def run_summary_job_by_stock(stock_id: int):
-    service.summarize_events(
-        event_ids=None,
-        stock_ids=[stock_id],
-        only_empty_summary=True,
-        only_active_crawl=True,
-        overwrite_existing_summary=False,
-        update_relevance_scores=True,
-    )
+    try:
+        logger.info("이벤트 요약 작업 시작 (stock_id=%d)", stock_id)
+        service.summarize_events(
+            event_ids=None,
+            stock_ids=[stock_id],
+            only_empty_summary=True,
+            only_active_crawl=True,
+            overwrite_existing_summary=False,
+            update_relevance_scores=True,
+        )
+        logger.info("이벤트 요약 작업 완료 (stock_id=%d)", stock_id)
+    except Exception as e:
+        logger.exception("이벤트 요약 작업 실패: %s", e)
 
 async def run_summary_job_by_id(eventId: int):
-    # 특정 이벤트만 강제 재요약하고 싶으면 예시:
-    service.summarize_events(
-        event_ids=[eventId],
-        stock_ids=None,
-        only_empty_summary=False,
-        only_active_crawl=False,
-        overwrite_existing_summary=True,
-        update_relevance_scores=True,
-    )
+    try:
+        logger.info("이벤트 요약 작업 시작 (event_id=%d)", eventId)
+        # 특정 이벤트만 강제 재요약하고 싶으면 예시:
+        service.summarize_events(
+            event_ids=[eventId],
+            stock_ids=None,
+            only_empty_summary=False,
+            only_active_crawl=False,
+            overwrite_existing_summary=True,
+            update_relevance_scores=True,
+        )
+        logger.info("이벤트 요약 작업 완료 (event_id=%d)", eventId)
+    except Exception as e:
+        logger.exception("이벤트 요약 작업 실패: %s", e)

@@ -26,11 +26,13 @@ sentiment_predictor = NewsSentimentService(
     )
 
 service = SummaryService(
-    eval_candidate_limit=30,  # 이벤트당 상위 30개만 재평가
-    eval_chunk_size=10,  # 10개씩 나눠서 평가
-    summary_news_limit=12,  # 최종 summary는 상위 12개 사용
-    content_char_limit=2200,  # 기사당 본문 최대 2200자
-    min_score_threshold_for_summary=0.15,  # 올리면 더 빡세게
+    eval_candidate_limit=30,                # 이벤트당 상위 30개만 재평가
+    eval_chunk_size=10,                     # 10개씩 나눠서 평가
+    summary_news_limit=12,                  # 최종 summary는 상위 12개 사용
+    content_char_limit=2200,                # 기사당 본문 최대 2200자
+    min_score_threshold_for_summary=0.15,   # 올리면 더 빡세게
+    max_workers=3,                          # 병렬 처리 워커 수
+    enable_parallel=True,                   # 병렬 처리 활성화 (2개 이상 이벤트에만 적용)
 )
 
 crawl_orchestrator = CrawlOrchestrator(
