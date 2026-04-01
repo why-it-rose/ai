@@ -3,7 +3,6 @@ import logging
 import re
 import time
 import threading
-import asyncio
 from pathlib import Path
 from typing import Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,29 +15,16 @@ from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
-STATUS_ACTIVE = "ACTIVE"
-
 
 class SummaryService:
-    """
-    이벤트별 관련 뉴스들을 재평가하고,
-    - event_news.relevance_score 보정
-    - events.summary 저장
-    
-    다중작업 지원:
-    - ThreadPoolExecutor 기반 병렬 이벤트 처리
-    - DB 연결 풀 관리
-    - 동시 LLM 호출 최적화
-    """
-
     def __init__(
         self,
-        eval_candidate_limit: int = 30,     # 이벤트당 점수 재평가 후보 수
-        eval_chunk_size: int = 10,          # LLM 한 번에 평가할 뉴스 수
-        summary_news_limit: int = 12,       # 최종 요약에 사용할 뉴스 수
-        content_char_limit: int = 2200,     # 기사당 본문 최대 길이
-        min_score_threshold_for_summary: float = 0.15,  # 최종 요약에 쓸 최소 점수
-        enable_parallel: bool = True,       # 병렬 처리 활성화
+        eval_candidate_limit: int = 30,
+        eval_chunk_size: int = 10,
+        summary_news_limit: int = 12,
+        content_char_limit: int = 2200,
+        min_score_threshold_for_summary: float = 0.15,
+        enable_parallel: bool = True,
     ):
         env_path = Path(__file__).resolve().parents[2] / ".env"
         env = dotenv_values(env_path)
@@ -54,7 +40,6 @@ class SummaryService:
 
         self.client = OpenAI(api_key=env.get("OPENAI_API_KEY"))
         self.model = env.get("OPENAI_MODEL", "gpt-5.4-mini")
-        # OpenAI 안정화 옵션 (기본값은 보수적으로 완화)
         self.openai_timeout = float(env.get("OPENAI_TIMEOUT", 60))
         self.openai_max_concurrency = int(env.get("OPENAI_MAX_CONCURRENCY", 3))
         self.openai_max_retries = int(env.get("OPENAI_MAX_RETRIES", 4))
@@ -65,16 +50,11 @@ class SummaryService:
         self.summary_news_limit = summary_news_limit
         self.content_char_limit = content_char_limit
         self.min_score_threshold_for_summary = min_score_threshold_for_summary
-        self.max_workers = 2  # 병렬 처리 워커 수 (고정)
+        self.max_workers = 2
         self.enable_parallel = enable_parallel
 
-        # 스레드 로컬 저장소 (스레드별 독립적 DB 연결)
         self._thread_local = threading.local()
 
-
-    # -----------------------------
-    # public
-    # -----------------------------
 
     def summarize_events(
         self,
@@ -85,17 +65,6 @@ class SummaryService:
         overwrite_existing_summary: bool = False,
         update_relevance_scores: bool = True,
     ) -> None:
-        """
-        기본 동작:
-        - summary 비어있는 ACTIVE 이벤트만 처리
-        - 각 이벤트의 event_news 상위 후보를 재평가
-        - relevance_score 보정
-        - 관련 기사만 요약해 events.summary 저장
-        
-        병렬 처리:
-        - enable_parallel=True인 경우 ThreadPoolExecutor로 병렬 처리
-        - enable_parallel=False인 경우 순차 처리
-        """
         with self._connect() as conn:
             events = self._load_target_events(
                 conn=conn,
@@ -129,7 +98,6 @@ class SummaryService:
         events: list[dict],
         update_relevance_scores: bool = True,
     ) -> None:
-        """순차 처리 (싱글 스레드)"""
         for event in events:
             try:
                 self._process_single_event(
@@ -145,8 +113,6 @@ class SummaryService:
         events: list[dict],
         update_relevance_scores: bool = True,
     ) -> None:
-        """병렬 처리 (멀티 스레드) - 이벤트를 워커 수만큼 사전 분할해 각 워커에 할당"""
-        # 이벤트를 워커 수만큼 분할해서 각 워커가 겹치지 않는 영역을 담당
         event_chunks = self._split_events_for_workers(events, self.max_workers)
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
@@ -176,7 +142,6 @@ class SummaryService:
             logger.info("병렬 처리 완료: %d개 배치, 총 %d개 이벤트", completed, total_completed)
 
     def _split_events_for_workers(self, events: list[dict], num_workers: int) -> list[list[dict]]:
-        """이벤트를 짝수/홀수로 분할 - 각 워커가 자신의 인덱스 담당"""
         if num_workers <= 0:
             num_workers = 1
 
@@ -191,7 +156,6 @@ class SummaryService:
         events_batch: list[dict],
         update_relevance_scores: bool = True,
     ) -> int:
-        """스레드에서 할당된 이벤트 배치 처리 (순차) - 락 없이 자신의 영역만 처리"""
         conn = self._get_thread_conn()
         completed = 0
         try:
@@ -210,18 +174,8 @@ class SummaryService:
                     )
         finally:
             pass  # 스레드 종료까지 연결 유지
-
-        return completed
-
-    def _process_single_event_in_thread(
-        self,
-        event: dict,
-        update_relevance_scores: bool = True,
-    ) -> None:
-        """(deprecated) 배치 처리 방식으로 변경됨"""
-        pass
-
-
+        finally:
+            pass
 
     def _process_single_event(
         self,
@@ -229,7 +183,6 @@ class SummaryService:
         event: dict,
         update_relevance_scores: bool = True,
     ) -> None:
-        """단일 이벤트 처리 로직"""
         event_id = event["id"]
         logger.info("이벤트 처리 시작 event_id=%s", event_id)
 
@@ -281,12 +234,8 @@ class SummaryService:
                 self._close_thread_conn()
             raise  # 상위로 예외 전파
 
-    # -----------------------------
-    # DB Connection Management
-    # -----------------------------
-
+    # DB 연결 관리
     def _get_thread_conn(self) -> pymysql.connections.Connection:
-        """스레드별 DB 연결 획득 (재사용)"""
         conn = getattr(self._thread_local, 'conn', None)
         if conn is not None and not self._is_connection_alive(conn):
             self._close_thread_conn()
@@ -313,7 +262,6 @@ class SummaryService:
 
     @staticmethod
     def _is_connection_alive(conn) -> bool:
-        """pymysql 연결이 아직 유효한지 확인한다."""
         try:
             if getattr(conn, "open", False) is False:
                 return False
@@ -324,33 +272,30 @@ class SummaryService:
 
     @contextmanager
     def _connect(self):
-        """컨텍스트 매니저로 DB 연결 관리 (메인 스레드용)"""
         conn = pymysql.connect(
             **self.db_config,
             cursorclass=pymysql.cursors.DictCursor,
             autocommit=False,
-            read_timeout=30,        # 읽기 타임아웃: 30초
-            write_timeout=30,       # 쓰기 타임아웃: 30초
-            connect_timeout=10,     # 연결 타임아웃: 10초
-        )
-        try:
-            # 트랜잭션 격리 수준 설정
-            with conn.cursor() as cur:
-                cur.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
-            logger.debug("메인 연결 격리 수준 설정: READ COMMITTED")
-            yield conn
-        except Exception as e:
-            logger.error("메인 연결 에러: %s", str(e), exc_info=True)
+            read_timeout=30,
+                write_timeout=30,
+                connect_timeout=10,
+            )
             try:
-                conn.rollback()
-            except:
-                pass
-            raise
-        finally:
-            conn.close()
-    
+                with conn.cursor() as cur:
+                    cur.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                logger.debug("메인 연결 격리 수준 설정: READ COMMITTED")
+                yield conn
+            except Exception as e:
+                logger.error("메인 연결 에러: %s", str(e), exc_info=True)
+                try:
+                    conn.rollback()
+                except:
+                    pass
+                raise
+            finally:
+                conn.close()
+
     def _close_thread_conn(self) -> None:
-        """스레드 종료 시 연결 닫기"""
         if hasattr(self._thread_local, 'conn') and self._thread_local.conn is not None:
             try:
                 self._thread_local.conn.close()
@@ -366,7 +311,6 @@ class SummaryService:
         only_empty_summary: bool = True,
         only_active_crawl: bool = True,
     ) -> list[dict]:
-        conditions = ["status = 'ACTIVE'"]
         params: list[Any] = []
 
         if only_active_crawl:
@@ -401,10 +345,6 @@ class SummaryService:
 
     @staticmethod
     def _load_candidate_news_for_event(conn, event_id: int, limit: int) -> list[dict]:
-        """
-        event_news 상위 후보들만 가져온다.
-        100개 이상이어도 처음부터 전부 모델에 넣지 않기 위함.
-        """
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -458,25 +398,7 @@ class SummaryService:
                 rows,
             )
 
-    # -----------------------------
-    # LLM evaluation
-    # -----------------------------
-
     def _evaluate_news_candidates(self, event: dict, candidate_news: list[dict]) -> dict[int, dict]:
-        """
-        상위 후보 뉴스들을 청크로 나눠서 평가.
-        - 청크별로 LLM 호출 (병렬화 가능)
-        - 각 청크의 결과 병합
-        
-        반환:
-        {
-            news_id: {
-                "is_relevant": bool,
-                "reason": str,
-                "adjustment": float
-            }
-        }
-        """
         result: dict[int, dict] = {}
 
         chunks = self._chunked(candidate_news, self.eval_chunk_size)
@@ -525,7 +447,6 @@ class SummaryService:
 
     @staticmethod
     def _parse_evaluation_items(items: list) -> dict[int, dict]:
-        """평가 아이템 파싱 (에러 처리 강화)"""
         result: dict[int, dict] = {}
         for item in items:
             try:
@@ -549,11 +470,9 @@ class SummaryService:
         return result
 
     def _build_evaluation_prompt(self, event: dict, news_rows: list[dict]) -> str:
-        """평가용 프롬프트 생성 (최적화)"""
         news_blocks = []
         for idx, row in enumerate(news_rows, start=1):
             content = self._normalize_content(row.get("content", ""))
-            # 콘텐츠 길이 제한 (프롬프트 토큰 절감)
             if len(content) > self.content_char_limit:
                 content = content[:self.content_char_limit]
 
@@ -573,8 +492,7 @@ news_id: {row["news_id"]}
 
         return f"""너는 주가 이벤트 원인 분석 전문가다.
 
-아래 뉴스들을 보고 각 뉴스가 실제 주가 변동의 원인/배경/재료와 관련 있는지 평가하라.
-반드시 뉴스별 평가만 수행하고, 최종 출력은 JSON만 반환하라.
+아래 뉴스들을 평가하여 주가 변동의 원인/배경/재료와의 관련성을 판단하라.
 
 [이벤트 정보]
 event_id: {event["id"]}
@@ -659,19 +577,11 @@ change_pct: {event["change_pct"]}
 
         self._update_event_news_scores(conn, updates)
 
-    # -----------------------------
-    # summary selection / generation
-    # -----------------------------
-
     def _select_news_for_summary(
         self,
         candidate_news: list[dict],
         evaluations: dict[int, dict],
     ) -> list[dict]:
-        """
-        LLM이 relevant라고 판단한 뉴스들 중
-        보정 점수 기준 상위 N개만 summary에 사용.
-        """
         selected = []
 
         for row in candidate_news:
@@ -703,7 +613,6 @@ change_pct: {event["change_pct"]}
             reverse=True,
         )
 
-        # 중복성 완화: 제목 기준 간단 dedupe
         deduped = []
         seen_title_keys = set()
         for row in selected:
@@ -769,7 +678,7 @@ change_pct: {event["change_pct"]}
 {joined_news}
 """.strip()
 
-        text = self._call_model(prompt).strip()
+        self._call_model(prompt).strip()
         text = self._strip_markdown_fence(text)
 
         if not text:
@@ -777,18 +686,7 @@ change_pct: {event["change_pct"]}
 
         return text
 
-    # -----------------------------
-    # OpenAI call (with retry & timeout)
-    # -----------------------------
-
     def _call_model(self, prompt: str, max_retries: int | None = None) -> str:
-        """
-        OpenAI 호출 (재시도 로직 포함)
-
-        Args:
-            prompt: 입력 프롬프트
-            max_retries: 최대 재시도 횟수
-        """
         retries = self.openai_max_retries if max_retries is None else int(max_retries)
         retries = max(0, retries)
         total_attempts = retries + 1
@@ -832,9 +730,6 @@ change_pct: {event["change_pct"]}
         logger.error("모든 재시도 실패, 빈 문자열 반환")
         return ""
 
-    # -----------------------------
-    # utils
-    # -----------------------------
 
     @staticmethod
     def _chunked(items: list[dict], size: int) -> list[list[dict]]:
