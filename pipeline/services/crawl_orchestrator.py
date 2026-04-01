@@ -50,9 +50,6 @@ class CrawlOrchestrator:
     async def run_entire(self):
         total_start = time.perf_counter()
 
-        repaired_count = self.request_generator.repair_pending_events()
-        if repaired_count:
-            logger.info("pending 보정 완료 count=%d", repaired_count)
 
         t = time.perf_counter()
         request = self.request_generator.generate_entire()
