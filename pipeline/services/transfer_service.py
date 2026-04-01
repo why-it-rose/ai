@@ -55,7 +55,10 @@ class TransferService:
         self.batch_size = batch_size
         self.relevance_service = EventNewsRelevanceService()
 
-    def transfer(self, tagged_file_paths: list[str] | str, link_events: bool = True) -> None:
+    def connect(self) -> pymysql.connections.Connection:
+        return self._connect()
+
+    def transfer(self, tagged_file_paths: list[str] | str, link_events: bool = True, conn=None) -> None:
         if isinstance(tagged_file_paths, str):
             tagged_file_paths = [tagged_file_paths]
 
@@ -76,13 +79,21 @@ class TransferService:
             logger.warning("처리할 수 있는 CSV 파일이 없습니다.")
             return
 
-        with self._connect() as conn:
+        if conn is not None:
+            # 외부 커넥션 사용 (caller가 트랜잭션 관리) → commit 안함
             for csv_path in exists_files:
                 logger.info("처리 시작: %s (link_events=%s)", csv_path.name, link_events)
-                self._process_csv(conn, csv_path, link_events=link_events)
+                self._process_csv(conn, csv_path, link_events=link_events, auto_commit=False)
                 logger.info("처리 완료: %s", csv_path.name)
+        else:
+            # 내부 커넥션 생성 (자동 트랜잭션 관리) → commit 함
+            with self._connect() as own_conn:
+                for csv_path in exists_files:
+                    logger.info("처리 시작: %s (link_events=%s)", csv_path.name, link_events)
+                    self._process_csv(own_conn, csv_path, link_events=link_events, auto_commit=True)
+                    logger.info("처리 완료: %s", csv_path.name)
 
-    def _process_csv(self, conn, csv_path: Path, *, link_events: bool = False) -> None:
+    def _process_csv(self, conn, csv_path: Path, *, link_events: bool = False, auto_commit: bool = True) -> None:
         total_news_new = 0
         total_news_link = 0
         total_tag_link = 0
@@ -167,7 +178,8 @@ class TransferService:
             url_to_id = self._load_url_to_id_by_urls(conn, list(seen_chunk_urls))
 
             if not url_to_id:
-                conn.commit()
+                if auto_commit:
+                    conn.commit()
                 logger.info("  → chunk=%d 매핑 가능한 news_id 없음", chunk_count)
                 continue
 
@@ -233,13 +245,15 @@ class TransferService:
             total_news_link += inserted_ns
             total_tag_link += inserted_nt
             total_event_link += inserted_en
-            conn.commit()
+            if auto_commit:
+                conn.commit()
 
         if link_events and expected_event_urls:
             activatable_event_ids = self._find_activatable_event_ids(conn, expected_event_urls)
             if activatable_event_ids:
                 self._mark_events_active(conn, activatable_event_ids)
-                conn.commit()
+                if auto_commit:
+                    conn.commit()
 
         logger.info(
             "csv=%s, new_news=%d, stock_links=%d, tag_links=%d, event_links=%d",

@@ -56,65 +56,71 @@ class CrawlOrchestrator:
     async def run_entire(self):
         total_start = time.perf_counter()
 
-
-        t = time.perf_counter()
-        request = self.request_generator.generate_entire()
-        logger.info("request 생성 elapsed=%.3fs", time.perf_counter() - t)
-
         processed_files = []
         skipped_units = []
         failed_units = []
 
-        for target in request.targets:
-            for period in target.periods:
-                event_id = getattr(period, "event_id", None)
+        with self.request_generator.connect() as rg_conn:
+            t = time.perf_counter()
+            request = self.request_generator.generate_entire(conn=rg_conn)
+            logger.info("request 생성 elapsed=%.3fs", time.perf_counter() - t)
 
-                acquired = self.request_generator.try_mark_event_pending(event_id)
-                if not acquired:
-                    skipped_units.append(
-                        {
-                            "stock": target.stock,
-                            "event_id": event_id,
-                            "reason": "already_processing_or_not_inactive",
-                        }
-                    )
+            for target in request.targets:
+                for period in target.periods:
+                    event_id = getattr(period, "event_id", None)
+
+                    rg_conn.ping(reconnect=True)
+                    acquired = self.request_generator.try_mark_event_pending(event_id, conn=rg_conn)
+                    if not acquired:
+                        skipped_units.append(
+                            {
+                                "stock": target.stock,
+                                "event_id": event_id,
+                                "reason": "already_processing_or_not_inactive",
+                            }
+                        )
+                        logger.info(
+                            "unit skip: stock=%s event_id=%s reason=already_processing_or_not_inactive",
+                            target.stock,
+                            event_id,
+                        )
+                        continue
+
+                    try:
+                        result = await self._run_single_unit(
+                            stock_name=target.stock,
+                            period=period,
+                            link_events=True,
+                            request_conn=rg_conn,
+                        )
+                        processed_files.append(result)
+
+                    except Exception as e:
+                        failed_units.append(
+                            {
+                                "stock": target.stock,
+                                "event_id": event_id,
+                                "error": str(e),
+                            }
+                        )
+                        logger.exception(
+                            "unit 처리 실패: stock=%s event_id=%s",
+                            target.stock,
+                            event_id,
+                        )
+
+                    # 상태 전환은 _run_single_unit 내부에서 즉시 처리되고,
+                    # 아래 대기는 다음 이벤트 요청 속도 제어용이다.
                     logger.info(
-                        "unit skip: stock=%s event_id=%s reason=already_processing_or_not_inactive",
-                        target.stock,
+                        "unit 처리 후 다음 이벤트 대기: event_id=%s wait=%.2fs",
                         event_id,
+                        self.INTER_UNIT_DELAY,
                     )
-                    continue
+                    await asyncio.sleep(self.INTER_UNIT_DELAY)
 
-                try:
-                    result = await self._run_single_unit(
-                        stock_name=target.stock,
-                        period=period,
-                        link_events=True,
-                    )
-                    processed_files.append(result)
-                    
-                except Exception as e:
-                    failed_units.append(
-                        {
-                            "stock": target.stock,
-                            "event_id": event_id,
-                            "error": str(e),
-                        }
-                    )
-                    logger.exception(
-                        "unit 처리 실패: stock=%s event_id=%s",
-                        target.stock,
-                        event_id,
-                    )
-                
-                # ★ 상태 전환(PENDING→ACTIVE/INACTIVE)은 위 _run_single_unit() 내에서 완료됨
-                # ★ 아래는 "다음 이벤트 시작 전 대기"용 딜레이일 뿐, 상태 전환과 무관
-                logger.info(
-                    "unit 처리 후 다음 이벤트 대기: event_id=%s wait=%.2fs",
-                    event_id,
-                    self.INTER_UNIT_DELAY,
-                )
-                await asyncio.sleep(self.INTER_UNIT_DELAY)
+
+            rg_conn.commit()
+            logger.info("모든 작업 완료 후 최종 commit 수행")
 
         logger.info("pipeline total elapsed=%.3fs", time.perf_counter() - total_start)
         return {
@@ -126,7 +132,7 @@ class CrawlOrchestrator:
             "failed": failed_units,
         }
 
-    async def _run_single_unit(self, stock_name: str, period, link_events: bool) -> dict:
+    async def _run_single_unit(self, stock_name: str, period, link_events: bool, request_conn=None) -> dict:
         event_id = getattr(period, "event_id", None)
 
         raw_path = self.csv_service.build_unit_csv_path(
@@ -198,10 +204,10 @@ class CrawlOrchestrator:
             )
 
             t = time.perf_counter()
-            self.transfer_service.transfer([ready_path], link_events=link_events)
+            self.transfer_service.transfer([ready_path], link_events=link_events, conn=request_conn)
 
             if link_events and event_id is not None:
-                self.request_generator.mark_event_active(event_id)
+                self.request_generator.mark_event_active(event_id, conn=request_conn)
 
             logger.info(
                 "db 적재 완료 elapsed=%.3fs stock=%s event_id=%s",
@@ -220,7 +226,7 @@ class CrawlOrchestrator:
 
         except Exception:
             if link_events and event_id is not None:
-                self.request_generator.recover_pending_event(event_id)
+                self.request_generator.recover_pending_event(event_id, conn=request_conn)
                 logger.warning(
                     "실패 event 상태 보정 완료: event_id=%s",
                     event_id,
