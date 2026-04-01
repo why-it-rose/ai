@@ -28,9 +28,11 @@ class YonhapCrawler(BaseCrawler):
             office_id: str = "1001",
             delay: float = 0.15,
             max_pages: int = 0,
+            empty_result_delay: float = 1.0,
     ):
         self.office_id = office_id
         self.delay = max(delay, 0.0)
+        self.empty_result_delay = max(empty_result_delay, 0.1)
         self.max_pages = max(max_pages, 0)
         self.logger = logging.getLogger(__name__)
 
@@ -93,6 +95,15 @@ class YonhapCrawler(BaseCrawler):
 
                 if not new_urls:
                     no_new_pages += 1
+                    empty_wait = self.empty_result_delay * (2 ** (no_new_pages - 1))
+                    self.logger.info(
+                        "빈 결과 받음: stock=%s no_new_pages=%d wait=%.2fs",
+                        stock,
+                        no_new_pages,
+                        empty_wait,
+                    )
+                    if no_new_pages < self.MAX_NO_NEW_PAGES:
+                        await asyncio.sleep(empty_wait)
                     start += 10
                     pages += 1
                     continue
@@ -110,7 +121,9 @@ class YonhapCrawler(BaseCrawler):
                         article["stock"] = stock
                         raw_items.append(article)
                     except httpx.HTTPError as e:
-                        self.logger.warning("기사 요청 실패: %s / %s", url, e)
+                        self.logger.warning("기사 요청 실패 (재시도 대기 후 계속): %s / %s", url, e)
+                        if self.delay > 0:
+                            await asyncio.sleep(self.delay * 2)
                     except Exception as e:
                         self.logger.warning("기사 파싱 실패: %s / %s", url, e)
 

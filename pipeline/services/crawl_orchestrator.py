@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import time
@@ -7,6 +8,8 @@ logger = logging.getLogger(__name__)
 
 
 class CrawlOrchestrator:
+    INTER_UNIT_DELAY = 2.0
+
     def __init__(
         self,
         request_generator,
@@ -40,6 +43,9 @@ class CrawlOrchestrator:
                     link_events=False,
                 )
                 processed_files.append(result)
+                
+                if len(processed_files) > 0:
+                    await asyncio.sleep(self.INTER_UNIT_DELAY)
 
         logger.info("pipeline total elapsed=%.3fs", time.perf_counter() - total_start)
         return {
@@ -86,6 +92,7 @@ class CrawlOrchestrator:
                         link_events=True,
                     )
                     processed_files.append(result)
+                    
                 except Exception as e:
                     failed_units.append(
                         {
@@ -99,6 +106,15 @@ class CrawlOrchestrator:
                         target.stock,
                         event_id,
                     )
+                
+                # ★ 상태 전환(PENDING→ACTIVE/INACTIVE)은 위 _run_single_unit() 내에서 완료됨
+                # ★ 아래는 "다음 이벤트 시작 전 대기"용 딜레이일 뿐, 상태 전환과 무관
+                logger.info(
+                    "unit 처리 후 다음 이벤트 대기: event_id=%s wait=%.2fs",
+                    event_id,
+                    self.INTER_UNIT_DELAY,
+                )
+                await asyncio.sleep(self.INTER_UNIT_DELAY)
 
         logger.info("pipeline total elapsed=%.3fs", time.perf_counter() - total_start)
         return {
