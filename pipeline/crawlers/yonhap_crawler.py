@@ -28,11 +28,9 @@ class YonhapCrawler(BaseCrawler):
             office_id: str = "1001",
             delay: float = 0.15,
             max_pages: int = 0,
-            empty_result_delay: float = 1.0,
     ):
         self.office_id = office_id
         self.delay = max(delay, 0.0)
-        self.empty_result_delay = max(empty_result_delay, 0.1)
         self.max_pages = max(max_pages, 0)
         self.logger = logging.getLogger(__name__)
 
@@ -66,10 +64,9 @@ class YonhapCrawler(BaseCrawler):
             raw_items: list[dict] = []
 
             start = 1
-            no_new_pages = 0
             pages = 0
 
-            while no_new_pages < self.MAX_NO_NEW_PAGES:
+            while True:
                 if self.max_pages > 0 and pages >= self.max_pages:
                     break
                 if len(raw_items) >= limit:
@@ -94,21 +91,12 @@ class YonhapCrawler(BaseCrawler):
                 new_urls = [u for u in urls if u not in seen_urls]
 
                 if not new_urls:
-                    no_new_pages += 1
-                    empty_wait = self.empty_result_delay * (2 ** (no_new_pages - 1))
                     self.logger.info(
-                        "빈 결과 받음: stock=%s no_new_pages=%d wait=%.2fs",
+                        "빈 결과 받음: stock=%s 대기 0.5초 후 종료",
                         stock,
-                        no_new_pages,
-                        empty_wait,
                     )
-                    if no_new_pages < self.MAX_NO_NEW_PAGES:
-                        await asyncio.sleep(empty_wait)
-                    start += 10
-                    pages += 1
-                    continue
-
-                no_new_pages = 0
+                    await asyncio.sleep(0.5)
+                    break
 
                 for url in new_urls:
                     if len(raw_items) >= limit:
