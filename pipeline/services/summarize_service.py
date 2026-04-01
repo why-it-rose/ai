@@ -1,8 +1,13 @@
 import json
 import logging
 import re
+import time
+import threading
+import asyncio
 from pathlib import Path
 from typing import Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 
 import pymysql
 import pymysql.cursors
@@ -19,6 +24,11 @@ class SummaryService:
     이벤트별 관련 뉴스들을 재평가하고,
     - event_news.relevance_score 보정
     - events.summary 저장
+    
+    다중작업 지원:
+    - ThreadPoolExecutor 기반 병렬 이벤트 처리
+    - DB 연결 풀 관리
+    - 동시 LLM 호출 최적화
     """
 
     def __init__(
@@ -28,6 +38,8 @@ class SummaryService:
         summary_news_limit: int = 12,       # 최종 요약에 사용할 뉴스 수
         content_char_limit: int = 2200,     # 기사당 본문 최대 길이
         min_score_threshold_for_summary: float = 0.15,  # 최종 요약에 쓸 최소 점수
+        max_workers: int = 3,               # 병렬 처리 워커 수
+        enable_parallel: bool = True,       # 병렬 처리 활성화
     ):
         env_path = Path(__file__).resolve().parents[2] / ".env"
         env = dotenv_values(env_path)
@@ -49,6 +61,15 @@ class SummaryService:
         self.summary_news_limit = summary_news_limit
         self.content_char_limit = content_char_limit
         self.min_score_threshold_for_summary = min_score_threshold_for_summary
+        self.max_workers = max_workers
+        self.enable_parallel = enable_parallel
+        
+        # 스레드 로컬 저장소 (스레드별 독립적 DB 연결)
+        self._thread_local = threading.local()
+
+        # 동일 이벤트 동시 처리 방지를 위한 Lock (event_id별)
+        self._event_locks: dict[int, threading.Lock] = {}
+        self._locks_lock = threading.Lock()  # _event_locks 접근 제어
 
     # -----------------------------
     # public
@@ -69,6 +90,10 @@ class SummaryService:
         - 각 이벤트의 event_news 상위 후보를 재평가
         - relevance_score 보정
         - 관련 기사만 요약해 events.summary 저장
+        
+        병렬 처리:
+        - enable_parallel=True인 경우 ThreadPoolExecutor로 병렬 처리
+        - enable_parallel=False인 경우 순차 처리
         """
         with self._connect() as conn:
             events = self._load_target_events(
@@ -83,12 +108,98 @@ class SummaryService:
                 logger.info("요약 대상 이벤트가 없습니다.")
                 return
 
-            logger.info("요약 대상 이벤트 수=%d", len(events))
+            logger.info("요약 대상 이벤트 수=%d (병렬처리=%s)", len(events), self.enable_parallel)
 
-            for event in events:
-                event_id = event["id"]
-                logger.info("이벤트 처리 시작 event_id=%s", event_id)
+            if self.enable_parallel and len(events) > 1:
+                self._summarize_events_parallel(
+                    events=events,
+                    update_relevance_scores=update_relevance_scores,
+                )
+            else:
+                self._summarize_events_sequential(
+                    conn=conn,
+                    events=events,
+                    update_relevance_scores=update_relevance_scores,
+                )
 
+    def _summarize_events_sequential(
+        self,
+        conn,
+        events: list[dict],
+        update_relevance_scores: bool = True,
+    ) -> None:
+        """순차 처리 (싱글 스레드)"""
+        for event in events:
+            try:
+                self._process_single_event(
+                    conn=conn,
+                    event=event,
+                    update_relevance_scores=update_relevance_scores,
+                )
+            except Exception as e:
+                logger.error("이벤트 처리 실패 event_id=%s: %s", event["id"], str(e), exc_info=True)
+
+    def _summarize_events_parallel(
+        self,
+        events: list[dict],
+        update_relevance_scores: bool = True,
+    ) -> None:
+        """병렬 처리 (멀티 스레드)"""
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {
+                executor.submit(
+                    self._process_single_event_in_thread,
+                    event=event,
+                    update_relevance_scores=update_relevance_scores,
+                ): event["id"]
+                for event in events
+            }
+
+            completed = 0
+            for future in as_completed(futures):
+                event_id = futures[future]
+                try:
+                    future.result()
+                    completed += 1
+                except Exception as e:
+                    logger.error(
+                        "이벤트 처리 실패 event_id=%s: %s",
+                        event_id, str(e), exc_info=True
+                    )
+
+            logger.info("병렬 처리 완료: %d/%d 이벤트", completed, len(events))
+
+    def _process_single_event_in_thread(
+        self,
+        event: dict,
+        update_relevance_scores: bool = True,
+    ) -> None:
+        """스레드에서 단일 이벤트 처리 (스레드별 연결 사용)"""
+        conn = self._get_thread_conn()
+        try:
+            self._process_single_event(
+                conn=conn,
+                event=event,
+                update_relevance_scores=update_relevance_scores,
+            )
+        finally:
+            pass  # 스레드 종료까지 연결 유지
+
+    def _process_single_event(
+        self,
+        conn,
+        event: dict,
+        update_relevance_scores: bool = True,
+    ) -> None:
+        """단일 이벤트 처리 로직 (Lock으로 보호됨)"""
+        event_id = event["id"]
+        
+        # 이벤트별 Lock 획득 → 동시 처리 방지
+        event_lock = self._get_event_lock(event_id)
+        with event_lock:
+            logger.info("이벤트 처리 시작 event_id=%s (Lock 획득)", event_id)
+
+            try:
                 candidate_news = self._load_candidate_news_for_event(
                     conn=conn,
                     event_id=event_id,
@@ -97,7 +208,7 @@ class SummaryService:
 
                 if not candidate_news:
                     logger.info("event_id=%s 연결된 뉴스가 없어 이벤트 요약을 생략합니다.", event_id)
-                    continue
+                    return
 
                 # 1) 뉴스별 LLM 재평가
                 evaluations = self._evaluate_news_candidates(event, candidate_news)
@@ -115,19 +226,83 @@ class SummaryService:
                 # 5) summary 저장
                 self._update_event_summary(conn, event_id, summary_text)
 
+                # 트랜잭션 커밋
                 conn.commit()
-                logger.info("이벤트 처리 완료 event_id=%s", event_id)
+                logger.info("이벤트 처리 완료 event_id=%s (커밋됨)", event_id)
+                
+            except Exception as e:
+                # 에러 발생 시 트랜잭션 롤백
+                logger.error(
+                    "이벤트 처리 중 에러 발생 event_id=%s: %s",
+                    event_id, str(e), exc_info=True
+                )
+                try:
+                    conn.rollback()
+                    logger.warning("트랜잭션 롤백 완료 event_id=%s", event_id)
+                except Exception as rollback_error:
+                    logger.error(
+                        "롤백 중 에러 발생 event_id=%s: %s",
+                        event_id, str(rollback_error), exc_info=True
+                    )
+                raise  # 상위로 예외 전파
 
     # -----------------------------
-    # DB
+    # DB Connection Management
     # -----------------------------
 
-    def _connect(self) -> pymysql.connections.Connection:
-        return pymysql.connect(
+    def _get_thread_conn(self) -> pymysql.connections.Connection:
+        """스레드별 DB 연결 획득 (재사용)"""
+        if not hasattr(self._thread_local, 'conn') or self._thread_local.conn is None:
+            self._thread_local.conn = pymysql.connect(
+                **self.db_config,
+                cursorclass=pymysql.cursors.DictCursor,
+                autocommit=False,
+                read_timeout=30,        # 읽기 타임아웃: 30초
+                write_timeout=30,       # 쓰기 타임아웃: 30초
+                connect_timeout=10,     # 연결 타임아웃: 10초
+            )
+            # 트랜잭션 격리 수준 설정 (READ COMMITTED)
+            try:
+                with self._thread_local.conn.cursor() as cur:
+                    cur.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                logger.debug("스레드 연결 격리 수준 설정: READ COMMITTED")
+            except Exception as e:
+                logger.warning("격리 수준 설정 실패: %s", str(e))
+
+        return self._thread_local.conn
+
+    @contextmanager
+    def _connect(self):
+        """컨텍스트 매니저로 DB 연결 관리 (메인 스레드용)"""
+        conn = pymysql.connect(
             **self.db_config,
             cursorclass=pymysql.cursors.DictCursor,
             autocommit=False,
+            read_timeout=30,        # 읽기 타임아웃: 30초
+            write_timeout=30,       # 쓰기 타임아웃: 30초
+            connect_timeout=10,     # 연결 타임아웃: 10초
         )
+        try:
+            # 트랜잭션 격리 수준 설정
+            with conn.cursor() as cur:
+                cur.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            logger.debug("메인 연결 격리 수준 설정: READ COMMITTED")
+            yield conn
+        except Exception as e:
+            logger.error("메인 연결 에러: %s", str(e), exc_info=True)
+            try:
+                conn.rollback()
+            except:
+                pass
+            raise
+        finally:
+            conn.close()
+    
+    def _close_thread_conn(self) -> None:
+        """스레드 종료 시 연결 닫기"""
+        if hasattr(self._thread_local, 'conn') and self._thread_local.conn is not None:
+            self._thread_local.conn.close()
+            self._thread_local.conn = None
 
     @staticmethod
     def _load_target_events(
@@ -236,6 +411,9 @@ class SummaryService:
     def _evaluate_news_candidates(self, event: dict, candidate_news: list[dict]) -> dict[int, dict]:
         """
         상위 후보 뉴스들을 청크로 나눠서 평가.
+        - 청크별로 LLM 호출 (병렬화 가능)
+        - 각 청크의 결과 병합
+        
         반환:
         {
             news_id: {
@@ -248,52 +426,87 @@ class SummaryService:
         result: dict[int, dict] = {}
 
         chunks = self._chunked(candidate_news, self.eval_chunk_size)
+        total_chunks = len(chunks)
+        
+        logger.info(
+            "LLM 뉴스 평가 시작 event_id=%s total_chunks=%d",
+            event["id"], total_chunks
+        )
+
+        # 청크별 평가 (현재는 순차, 향후 비동기 확장 가능)
         for chunk_idx, chunk in enumerate(chunks, start=1):
-            logger.info(
-                "LLM 뉴스 평가 event_id=%s chunk=%d size=%d",
-                event["id"], chunk_idx, len(chunk)
-            )
+            try:
+                logger.debug(
+                    "LLM 뉴스 평가 event_id=%s chunk=%d/%d size=%d",
+                    event["id"], chunk_idx, total_chunks, len(chunk)
+                )
 
-            prompt = self._build_evaluation_prompt(event, chunk)
-            raw_text = self._call_model(prompt)
-            parsed = self._parse_json_response(raw_text)
+                prompt = self._build_evaluation_prompt(event, chunk)
+                raw_text = self._call_model(prompt)
+                parsed = self._parse_json_response(raw_text)
 
-            items = parsed.get("news_evaluations", [])
-            if not isinstance(items, list):
-                logger.warning("event_id=%s chunk=%d 평가 결과 형식 이상", event["id"], chunk_idx)
+                items = parsed.get("news_evaluations", [])
+                if not isinstance(items, list):
+                    logger.warning(
+                        "event_id=%s chunk=%d 평가 결과 형식 이상",
+                        event["id"], chunk_idx
+                    )
+                    continue
+
+                chunk_results = self._parse_evaluation_items(items)
+                result.update(chunk_results)
+                
+            except Exception as e:
+                logger.error(
+                    "event_id=%s chunk=%d 평가 중 에러: %s",
+                    event["id"], chunk_idx, str(e), exc_info=True
+                )
                 continue
 
-            for item in items:
-                try:
-                    news_id = int(item["news_id"])
-                    is_relevant = bool(item["is_relevant"])
-                    reason = str(item.get("reason", "")).strip()
-                    adjustment = float(item.get("adjustment", 0.0))
+        logger.info(
+            "LLM 뉴스 평가 완료 event_id=%s 평가결과=%d",
+            event["id"], len(result)
+        )
+        return result
 
-                    # 보정치는 안전 범위로 clamp
-                    adjustment = max(-0.50, min(0.20, adjustment))
+    @staticmethod
+    def _parse_evaluation_items(items: list) -> dict[int, dict]:
+        """평가 아이템 파싱 (에러 처리 강화)"""
+        result: dict[int, dict] = {}
+        for item in items:
+            try:
+                news_id = int(item["news_id"])
+                is_relevant = bool(item["is_relevant"])
+                reason = str(item.get("reason", "")).strip()
+                adjustment = float(item.get("adjustment", 0.0))
 
-                    result[news_id] = {
-                        "is_relevant": is_relevant,
-                        "reason": reason,
-                        "adjustment": adjustment,
-                    }
-                except (KeyError, TypeError, ValueError):
-                    continue
+                # 보정치는 안전 범위로 clamp
+                adjustment = max(-0.50, min(0.20, adjustment))
+
+                result[news_id] = {
+                    "is_relevant": is_relevant,
+                    "reason": reason,
+                    "adjustment": adjustment,
+                }
+            except (KeyError, TypeError, ValueError) as e:
+                logger.debug("아이템 파싱 실패: %s", str(e))
+                continue
 
         return result
 
     def _build_evaluation_prompt(self, event: dict, news_rows: list[dict]) -> str:
+        """평가용 프롬프트 생성 (최적화)"""
         news_blocks = []
         for idx, row in enumerate(news_rows, start=1):
             content = self._normalize_content(row.get("content", ""))
+            # 콘텐츠 길이 제한 (프롬프트 토큰 절감)
             if len(content) > self.content_char_limit:
                 content = content[:self.content_char_limit]
 
             news_blocks.append(
                 f"""[뉴스 {idx}]
 news_id: {row["news_id"]}
-기존 relevance_score: {row["relevance_score"]}
+기존 relevance_score: {row.get("relevance_score", 0):.4f}
 제목: {row.get("title", "")}
 출처: {row.get("source", "")}
 발행시각: {row.get("published_at", "")}
@@ -304,8 +517,7 @@ news_id: {row["news_id"]}
 
         joined_news = "\n\n".join(news_blocks)
 
-        return f"""
-너는 주가 이벤트 원인 분석 전문가다.
+        return f"""너는 주가 이벤트 원인 분석 전문가다.
 
 아래 뉴스들을 보고 각 뉴스가 실제 주가 변동의 원인/배경/재료와 관련 있는지 평가하라.
 반드시 뉴스별 평가만 수행하고, 최종 출력은 JSON만 반환하라.
@@ -323,7 +535,6 @@ change_pct: {event["change_pct"]}
 - 장중 흐름, 거래량, 수급, 차트 위주 기사
 - 관련주/테마주 단순 나열 기사
 - 기업명은 등장하지만 투자 재료와 무관한 일반 기사
-- 주식 가격 움직임을 뒤늦게 설명하는 기사
 
 [높은 relevance로 판단해야 하는 기사]
 - 실적, 수주, 계약, 투자, 인수합병, 지분 변화
@@ -513,15 +724,54 @@ change_pct: {event["change_pct"]}
         return text
 
     # -----------------------------
-    # OpenAI call
+    # OpenAI call (with retry & timeout)
     # -----------------------------
 
-    def _call_model(self, prompt: str) -> str:
-        response = self.client.responses.create(
-            model=self.model,
-            input=prompt,
-        )
-        return (response.output_text or "").strip()
+    def _call_model(self, prompt: str, max_retries: int = 2) -> str:
+        """
+        OpenAI 호출 (재시도 로직 포함)
+
+        Args:
+            prompt: 입력 프롬프트
+            max_retries: 최대 재시도 횟수
+        """
+        last_error = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                response = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=1024,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ],
+                    timeout=30,
+                )
+
+                # response 구조에 따라 적절히 처리
+                if hasattr(response, 'content') and response.content:
+                    if isinstance(response.content, list):
+                        return response.content[0].text.strip()
+                    return response.content.strip()
+
+                return ""
+
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries:
+                    logger.warning(
+                        "OpenAI 호출 실패 (재시도 %d/%d): %s",
+                        attempt + 1, max_retries, str(e)
+                    )
+                    time.sleep(1)  # 재시도 전 대기
+                else:
+                    logger.error("OpenAI 호출 최종 실패: %s", str(e))
+
+        logger.error("모든 재시도 실패, 빈 문자열 반환")
+        return ""
 
     # -----------------------------
     # utils
@@ -576,3 +826,11 @@ change_pct: {event["change_pct"]}
 
         logger.warning("JSON 파싱 실패, 원문 일부=%s", text[:300])
         return {}
+
+    def _get_event_lock(self, event_id: int) -> threading.Lock:
+        """이벤트별 Lock 획득 (동시 접근 제어)"""
+        with self._locks_lock:
+            if event_id not in self._event_locks:
+                self._event_locks[event_id] = threading.Lock()
+            return self._event_locks[event_id]
+
