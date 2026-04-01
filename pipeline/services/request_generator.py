@@ -29,10 +29,18 @@ class RequestGenerator:
             autocommit=False,
         )
 
-    def generate_entire(self) -> CrawlJobRequest:
-        with self._connect() as conn:
+    def connect(self) -> pymysql.connections.Connection:
+        return self._connect()
+
+    def generate_entire(self, conn=None) -> CrawlJobRequest:
+        if conn is not None:
             events = self._load_crawl_target_events(conn)
             conn.commit()
+            return self.build_targets(events)
+
+        with self._connect() as own_conn:
+            events = self._load_crawl_target_events(own_conn)
+            own_conn.commit()
             return self.build_targets(events)
 
     def build_targets(self, rows: list[dict]) -> CrawlJobRequest:
@@ -75,48 +83,110 @@ class RequestGenerator:
             )
             return list(cur.fetchall())
 
-    def try_mark_event_pending(self, event_id: int) -> bool:
+    def try_mark_event_pending(self, event_id: int, conn=None) -> bool:
         if event_id is None:
             return True
 
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                affected = cur.execute(
-                    """
-                    UPDATE events
-                    SET crawl_status = 'PENDING'
-                    WHERE id = %s
-                      AND crawl_status = 'INACTIVE'
-                      AND status = 'ACTIVE'
-                    """,
-                    (event_id,),
-                )
-            conn.commit()
-            return affected > 0
+        if conn is not None:
+            return self._try_mark_event_pending(conn, event_id)
 
-    def rollback_event_to_inactive(self, event_id: int) -> None:
+        with self._connect() as own_conn:
+            return self._try_mark_event_pending(own_conn, event_id)
+
+    @staticmethod
+    def _try_mark_event_pending(conn, event_id: int) -> bool:
+        with conn.cursor() as cur:
+            affected = cur.execute(
+                """
+                UPDATE events
+                SET crawl_status = 'PENDING'
+                WHERE id = %s
+                  AND crawl_status = 'INACTIVE'
+                  AND status = 'ACTIVE'
+                """,
+                (event_id,),
+            )
+        conn.commit()
+        return affected > 0
+
+    def rollback_event_to_inactive(self, event_id: int, conn=None) -> None:
         if event_id is None:
             return
 
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE events
-                    SET crawl_status = 'INACTIVE'
-                    WHERE id = %s
-                      AND crawl_status = 'PENDING'
-                    """,
-                    (event_id,),
-                )
-            conn.commit()
+        if conn is not None:
+            self._rollback_event_to_inactive(conn, event_id)
+            return
 
-    def mark_event_active(self, event_id: int) -> None:
+        with self._connect() as own_conn:
+            self._rollback_event_to_inactive(own_conn, event_id)
+
+    @staticmethod
+    def _rollback_event_to_inactive(conn, event_id: int) -> None:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE events
+                SET crawl_status = 'INACTIVE'
+                WHERE id = %s
+                  AND crawl_status = 'PENDING'
+                """,
+                (event_id,),
+            )
+        conn.commit()
+
+    def mark_event_active(self, event_id: int, conn=None) -> None:
         if event_id is None:
             return
 
-        with self._connect() as conn:
-            with conn.cursor() as cur:
+        if conn is not None:
+            self._mark_event_active(conn, event_id)
+            return
+
+        with self._connect() as own_conn:
+            self._mark_event_active(own_conn, event_id)
+
+    @staticmethod
+    def _mark_event_active(conn, event_id: int) -> None:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE events
+                SET crawl_status = 'ACTIVE'
+                WHERE id = %s
+                  AND crawl_status = 'PENDING'
+                """,
+                (event_id,),
+            )
+        conn.commit()
+
+    def recover_pending_event(self, event_id: int, conn=None) -> None:
+        if event_id is None:
+            return
+
+        if conn is not None:
+            self._recover_pending_event(conn, event_id)
+            return
+
+        with self._connect() as own_conn:
+            self._recover_pending_event(own_conn, event_id)
+
+    @staticmethod
+    def _recover_pending_event(conn, event_id: int) -> None:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT EXISTS(
+                    SELECT 1
+                    FROM event_news
+                    WHERE event_id = %s
+                ) AS has_event_news
+                """,
+                (event_id,),
+            )
+            row = cur.fetchone()
+            has_event_news = bool(row and row["has_event_news"])
+
+            if has_event_news:
                 cur.execute(
                     """
                     UPDATE events
@@ -126,55 +196,23 @@ class RequestGenerator:
                     """,
                     (event_id,),
                 )
-            conn.commit()
-
-    def recover_pending_event(self, event_id: int) -> None:
-        if event_id is None:
-            return
-
-        with self._connect() as conn:
-            with conn.cursor() as cur:
+            else:
                 cur.execute(
                     """
-                    SELECT EXISTS(
-                        SELECT 1
-                        FROM event_news
-                        WHERE event_id = %s
-                    ) AS has_event_news
+                    UPDATE events
+                    SET crawl_status = 'INACTIVE'
+                    WHERE id = %s
+                      AND crawl_status = 'PENDING'
                     """,
                     (event_id,),
                 )
-                row = cur.fetchone()
-                has_event_news = bool(row and row["has_event_news"])
-
-                if has_event_news:
-                    cur.execute(
-                        """
-                        UPDATE events
-                        SET crawl_status = 'ACTIVE'
-                        WHERE id = %s
-                          AND crawl_status = 'PENDING'
-                        """,
-                        (event_id,),
-                    )
-                else:
-                    cur.execute(
-                        """
-                        UPDATE events
-                        SET crawl_status = 'INACTIVE'
-                        WHERE id = %s
-                          AND crawl_status = 'PENDING'
-                        """,
-                        (event_id,),
-                    )
-
-            conn.commit()
+        conn.commit()
 
     def repair_pending_events(self) -> int:
         repaired = 0
 
-        with self._connect() as conn:
-            with conn.cursor() as cur:
+        with self._connect() as own_conn:
+            with own_conn.cursor() as cur:
                 cur.execute(
                     """
                     SELECT id
@@ -185,11 +223,11 @@ class RequestGenerator:
                 )
                 pending_ids = [row["id"] for row in cur.fetchall()]
 
-            conn.commit()
+            own_conn.commit()
 
-        for event_id in pending_ids:
-            self.recover_pending_event(event_id)
-            repaired += 1
+            for event_id in pending_ids:
+                self._recover_pending_event(own_conn, event_id)
+                repaired += 1
 
         return repaired
 
