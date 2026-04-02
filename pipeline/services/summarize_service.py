@@ -4,7 +4,7 @@ import re
 import time
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 
@@ -29,9 +29,16 @@ class SummaryService:
         env_path = Path(__file__).resolve().parents[2] / ".env"
         env = dotenv_values(env_path)
 
+        db_port_raw = env.get("DB_PORT")
+        db_port = int(db_port_raw) if db_port_raw is not None else 3306
+        openai_model = env.get("OPENAI_MODEL") or "gpt-5.4-mini"
+        openai_timeout_raw = env.get("OPENAI_TIMEOUT")
+        openai_max_concurrency_raw = env.get("OPENAI_MAX_CONCURRENCY")
+        openai_max_retries_raw = env.get("OPENAI_MAX_RETRIES")
+
         self.db_config = {
             "host": env.get("DB_HOST"),
-            "port": int(env.get("DB_PORT", 3306)),
+            "port": db_port,
             "user": env.get("DB_USER"),
             "password": env.get("DB_PASSWORD"),
             "database": env.get("DB_NAME"),
@@ -39,10 +46,10 @@ class SummaryService:
         }
 
         self.client = OpenAI(api_key=env.get("OPENAI_API_KEY"))
-        self.model = env.get("OPENAI_MODEL", "gpt-5.4-mini")
-        self.openai_timeout = float(env.get("OPENAI_TIMEOUT", 60))
-        self.openai_max_concurrency = int(env.get("OPENAI_MAX_CONCURRENCY", 3))
-        self.openai_max_retries = int(env.get("OPENAI_MAX_RETRIES", 4))
+        self.model = openai_model
+        self.openai_timeout = float(openai_timeout_raw) if openai_timeout_raw is not None else 60.0
+        self.openai_max_concurrency = int(openai_max_concurrency_raw) if openai_max_concurrency_raw is not None else 3
+        self.openai_max_retries = int(openai_max_retries_raw) if openai_max_retries_raw is not None else 4
         self._openai_semaphore = threading.BoundedSemaphore(max(1, self.openai_max_concurrency))
 
         self.eval_candidate_limit = eval_candidate_limit
@@ -174,8 +181,8 @@ class SummaryService:
                     )
         finally:
             pass  # 스레드 종료까지 연결 유지
-        finally:
-            pass
+
+        return completed
 
     def _process_single_event(
         self,
@@ -236,7 +243,7 @@ class SummaryService:
 
     # DB 연결 관리
     def _get_thread_conn(self) -> pymysql.connections.Connection:
-        conn = getattr(self._thread_local, 'conn', None)
+        conn = cast(pymysql.connections.Connection | None, getattr(self._thread_local, 'conn', None))
         if conn is not None and not self._is_connection_alive(conn):
             self._close_thread_conn()
             conn = None
@@ -258,7 +265,7 @@ class SummaryService:
             except Exception as e:
                 logger.warning("격리 수준 설정 실패: %s", str(e))
 
-        return self._thread_local.conn
+        return cast(pymysql.connections.Connection, self._thread_local.conn)
 
     @staticmethod
     def _is_connection_alive(conn) -> bool:
@@ -277,23 +284,23 @@ class SummaryService:
             cursorclass=pymysql.cursors.DictCursor,
             autocommit=False,
             read_timeout=30,
-                write_timeout=30,
-                connect_timeout=10,
-            )
+            write_timeout=30,
+            connect_timeout=10,
+        )
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            logger.debug("메인 연결 격리 수준 설정: READ COMMITTED")
+            yield conn
+        except Exception as e:
+            logger.error("메인 연결 에러: %s", str(e), exc_info=True)
             try:
-                with conn.cursor() as cur:
-                    cur.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
-                logger.debug("메인 연결 격리 수준 설정: READ COMMITTED")
-                yield conn
-            except Exception as e:
-                logger.error("메인 연결 에러: %s", str(e), exc_info=True)
-                try:
-                    conn.rollback()
-                except:
-                    pass
-                raise
-            finally:
-                conn.close()
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
 
     def _close_thread_conn(self) -> None:
         if hasattr(self._thread_local, 'conn') and self._thread_local.conn is not None:
@@ -311,6 +318,7 @@ class SummaryService:
         only_empty_summary: bool = True,
         only_active_crawl: bool = True,
     ) -> list[dict]:
+        conditions = ["status = 'ACTIVE'"]
         params: list[Any] = []
 
         if only_active_crawl:
@@ -492,7 +500,8 @@ news_id: {row["news_id"]}
 
         return f"""너는 주가 이벤트 원인 분석 전문가다.
 
-아래 뉴스들을 평가하여 주가 변동의 원인/배경/재료와의 관련성을 판단하라.
+아래 뉴스들을 보고 각 뉴스가 실제 주가 변동의 원인/배경/재료와 관련 있는지 평가하라.
+반드시 뉴스별 평가만 수행하고, 최종 출력은 JSON만 반환하라.
 
 [이벤트 정보]
 event_id: {event["id"]}
@@ -559,10 +568,11 @@ change_pct: {event["change_pct"]}
         updates: list[tuple] = []
 
         for row in candidate_news:
+            row = cast(dict[str, Any], row)
             news_id = row["news_id"]
             old_score = float(row.get("relevance_score") or 0.0)
 
-            evaluation = evaluations.get(news_id)
+            evaluation = cast(dict[str, Any] | None, evaluations.get(news_id))
             if not evaluation:
                 continue
 
@@ -577,16 +587,25 @@ change_pct: {event["change_pct"]}
 
         self._update_event_news_scores(conn, updates)
 
+    # -----------------------------
+    # summary selection / generation
+    # -----------------------------
+
     def _select_news_for_summary(
         self,
         candidate_news: list[dict],
         evaluations: dict[int, dict],
     ) -> list[dict]:
+        """
+        LLM이 relevant라고 판단한 뉴스들 중
+        보정 점수 기준 상위 N개만 summary에 사용.
+        """
         selected = []
 
         for row in candidate_news:
+            row = cast(dict[str, Any], row)
             news_id = row["news_id"]
-            evaluation = evaluations.get(news_id)
+            evaluation = cast(dict[str, Any] | None, evaluations.get(news_id))
             if not evaluation:
                 continue
 
@@ -613,6 +632,7 @@ change_pct: {event["change_pct"]}
             reverse=True,
         )
 
+        # 중복성 완화: 제목 기준 간단 dedupe
         deduped = []
         seen_title_keys = set()
         for row in selected:
@@ -678,7 +698,7 @@ change_pct: {event["change_pct"]}
 {joined_news}
 """.strip()
 
-        self._call_model(prompt).strip()
+        text = self._call_model(prompt).strip()
         text = self._strip_markdown_fence(text)
 
         if not text:
@@ -686,7 +706,18 @@ change_pct: {event["change_pct"]}
 
         return text
 
+    # -----------------------------
+    # OpenAI call (with retry & timeout)
+    # -----------------------------
+
     def _call_model(self, prompt: str, max_retries: int | None = None) -> str:
+        """
+        OpenAI 호출 (재시도 로직 포함)
+
+        Args:
+            prompt: 입력 프롬프트
+            max_retries: 최대 재시도 횟수
+        """
         retries = self.openai_max_retries if max_retries is None else int(max_retries)
         retries = max(0, retries)
         total_attempts = retries + 1
@@ -730,6 +761,9 @@ change_pct: {event["change_pct"]}
         logger.error("모든 재시도 실패, 빈 문자열 반환")
         return ""
 
+    # -----------------------------
+    # utils
+    # -----------------------------
 
     @staticmethod
     def _chunked(items: list[dict], size: int) -> list[list[dict]]:
@@ -771,7 +805,7 @@ change_pct: {event["change_pct"]}
             pass
 
         # 2차: JSON 객체 부분만 추출
-        match = re.search(r"\{.*\}", text, re.DOTALL)
+        match = re.search(r"{.*}", text, re.DOTALL)
         if match:
             try:
                 return json.loads(match.group(0))
