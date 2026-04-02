@@ -3,9 +3,8 @@ import logging
 import re
 import time
 import threading
-import asyncio
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 
@@ -16,37 +15,30 @@ from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
-STATUS_ACTIVE = "ACTIVE"
-
 
 class SummaryService:
-    """
-    이벤트별 관련 뉴스들을 재평가하고,
-    - event_news.relevance_score 보정
-    - events.summary 저장
-    
-    다중작업 지원:
-    - ThreadPoolExecutor 기반 병렬 이벤트 처리
-    - DB 연결 풀 관리
-    - 동시 LLM 호출 최적화
-    """
-
     def __init__(
         self,
-        eval_candidate_limit: int = 30,     # 이벤트당 점수 재평가 후보 수
-        eval_chunk_size: int = 10,          # LLM 한 번에 평가할 뉴스 수
-        summary_news_limit: int = 12,       # 최종 요약에 사용할 뉴스 수
-        content_char_limit: int = 2200,     # 기사당 본문 최대 길이
-        min_score_threshold_for_summary: float = 0.15,  # 최종 요약에 쓸 최소 점수
-        max_workers: int = 3,               # 병렬 처리 워커 수
-        enable_parallel: bool = True,       # 병렬 처리 활성화
+        eval_candidate_limit: int = 30,
+        eval_chunk_size: int = 10,
+        summary_news_limit: int = 12,
+        content_char_limit: int = 2200,
+        min_score_threshold_for_summary: float = 0.15,
+        enable_parallel: bool = True,
     ):
         env_path = Path(__file__).resolve().parents[2] / ".env"
         env = dotenv_values(env_path)
 
+        db_port_raw = env.get("DB_PORT")
+        db_port = int(db_port_raw) if db_port_raw is not None else 3306
+        openai_model = env.get("OPENAI_MODEL") or "gpt-5.4-mini"
+        openai_timeout_raw = env.get("OPENAI_TIMEOUT")
+        openai_max_concurrency_raw = env.get("OPENAI_MAX_CONCURRENCY")
+        openai_max_retries_raw = env.get("OPENAI_MAX_RETRIES")
+
         self.db_config = {
             "host": env.get("DB_HOST"),
-            "port": int(env.get("DB_PORT", 3306)),
+            "port": db_port,
             "user": env.get("DB_USER"),
             "password": env.get("DB_PASSWORD"),
             "database": env.get("DB_NAME"),
@@ -54,26 +46,22 @@ class SummaryService:
         }
 
         self.client = OpenAI(api_key=env.get("OPENAI_API_KEY"))
-        self.model = env.get("OPENAI_MODEL", "gpt-5.4-mini")
+        self.model = openai_model
+        self.openai_timeout = float(openai_timeout_raw) if openai_timeout_raw is not None else 60.0
+        self.openai_max_concurrency = int(openai_max_concurrency_raw) if openai_max_concurrency_raw is not None else 3
+        self.openai_max_retries = int(openai_max_retries_raw) if openai_max_retries_raw is not None else 4
+        self._openai_semaphore = threading.BoundedSemaphore(max(1, self.openai_max_concurrency))
 
         self.eval_candidate_limit = eval_candidate_limit
         self.eval_chunk_size = eval_chunk_size
         self.summary_news_limit = summary_news_limit
         self.content_char_limit = content_char_limit
         self.min_score_threshold_for_summary = min_score_threshold_for_summary
-        self.max_workers = max_workers
+        self.max_workers = 2
         self.enable_parallel = enable_parallel
-        
-        # 스레드 로컬 저장소 (스레드별 독립적 DB 연결)
+
         self._thread_local = threading.local()
 
-        # 동일 이벤트 동시 처리 방지를 위한 Lock (event_id별)
-        self._event_locks: dict[int, threading.Lock] = {}
-        self._locks_lock = threading.Lock()  # _event_locks 접근 제어
-
-    # -----------------------------
-    # public
-    # -----------------------------
 
     def summarize_events(
         self,
@@ -84,17 +72,6 @@ class SummaryService:
         overwrite_existing_summary: bool = False,
         update_relevance_scores: bool = True,
     ) -> None:
-        """
-        기본 동작:
-        - summary 비어있는 ACTIVE 이벤트만 처리
-        - 각 이벤트의 event_news 상위 후보를 재평가
-        - relevance_score 보정
-        - 관련 기사만 요약해 events.summary 저장
-        
-        병렬 처리:
-        - enable_parallel=True인 경우 ThreadPoolExecutor로 병렬 처리
-        - enable_parallel=False인 경우 순차 처리
-        """
         with self._connect() as conn:
             events = self._load_target_events(
                 conn=conn,
@@ -128,7 +105,6 @@ class SummaryService:
         events: list[dict],
         update_relevance_scores: bool = True,
     ) -> None:
-        """순차 처리 (싱글 스레드)"""
         for event in events:
             try:
                 self._process_single_event(
@@ -144,46 +120,69 @@ class SummaryService:
         events: list[dict],
         update_relevance_scores: bool = True,
     ) -> None:
-        """병렬 처리 (멀티 스레드)"""
+        event_chunks = self._split_events_for_workers(events, self.max_workers)
+
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = {
                 executor.submit(
-                    self._process_single_event_in_thread,
-                    event=event,
+                    self._process_event_batch_in_thread,
+                    events_batch=chunk,
                     update_relevance_scores=update_relevance_scores,
-                ): event["id"]
-                for event in events
+                ): f"batch_{idx}"
+                for idx, chunk in enumerate(event_chunks) if chunk
             }
 
             completed = 0
+            total_completed = 0
             for future in as_completed(futures):
-                event_id = futures[future]
+                batch_id = futures[future]
                 try:
-                    future.result()
+                    batch_completed = future.result()
+                    total_completed += batch_completed
                     completed += 1
                 except Exception as e:
                     logger.error(
-                        "이벤트 처리 실패 event_id=%s: %s",
-                        event_id, str(e), exc_info=True
+                        "배치 처리 실패 %s: %s",
+                        batch_id, str(e), exc_info=True
                     )
 
-            logger.info("병렬 처리 완료: %d/%d 이벤트", completed, len(events))
+            logger.info("병렬 처리 완료: %d개 배치, 총 %d개 이벤트", completed, total_completed)
 
-    def _process_single_event_in_thread(
+    def _split_events_for_workers(self, events: list[dict], num_workers: int) -> list[list[dict]]:
+        if num_workers <= 0:
+            num_workers = 1
+
+        chunks = [[] for _ in range(num_workers)]
+        for idx, event in enumerate(events):
+            chunks[idx % num_workers].append(event)
+
+        return chunks
+
+    def _process_event_batch_in_thread(
         self,
-        event: dict,
+        events_batch: list[dict],
         update_relevance_scores: bool = True,
-    ) -> None:
-        """스레드에서 단일 이벤트 처리 (스레드별 연결 사용)"""
+    ) -> int:
         conn = self._get_thread_conn()
+        completed = 0
         try:
-            self._process_single_event(
-                conn=conn,
-                event=event,
-                update_relevance_scores=update_relevance_scores,
-            )
+            for event in events_batch:
+                try:
+                    self._process_single_event(
+                        conn=conn,
+                        event=event,
+                        update_relevance_scores=update_relevance_scores,
+                    )
+                    completed += 1
+                except Exception as e:
+                    logger.error(
+                        "배치 내 이벤트 처리 실패 event_id=%s: %s",
+                        event["id"], str(e), exc_info=True
+                    )
         finally:
             pass  # 스레드 종료까지 연결 유지
+
+        return completed
 
     def _process_single_event(
         self,
@@ -191,68 +190,65 @@ class SummaryService:
         event: dict,
         update_relevance_scores: bool = True,
     ) -> None:
-        """단일 이벤트 처리 로직 (Lock으로 보호됨)"""
         event_id = event["id"]
-        
-        # 이벤트별 Lock 획득 → 동시 처리 방지
-        event_lock = self._get_event_lock(event_id)
-        with event_lock:
-            logger.info("이벤트 처리 시작 event_id=%s (Lock 획득)", event_id)
+        logger.info("이벤트 처리 시작 event_id=%s", event_id)
 
+        try:
+            candidate_news = self._load_candidate_news_for_event(
+                conn=conn,
+                event_id=event_id,
+                limit=self.eval_candidate_limit,
+            )
+
+            if not candidate_news:
+                logger.info("event_id=%s 연결된 뉴스가 없어 이벤트 요약을 생략합니다.", event_id)
+                return
+
+            # 1) 뉴스별 LLM 재평가
+            evaluations = self._evaluate_news_candidates(event, candidate_news)
+
+            # 2) relevance_score 보정 반영
+            if update_relevance_scores and evaluations:
+                self._apply_relevance_updates(conn, event_id, candidate_news, evaluations)
+
+            # 3) 보정된 기준으로 최종 요약용 뉴스 선별
+            summary_news = self._select_news_for_summary(candidate_news, evaluations)
+
+            # 4) 이벤트 summary 생성
+            summary_text = self._generate_event_summary(event, summary_news)
+
+            # 5) summary 저장
+            self._update_event_summary(conn, event_id, summary_text)
+
+            # 트랜잭션 커밋
+            conn.commit()
+            logger.info("이벤트 처리 완료 event_id=%s (커밋됨)", event_id)
+
+        except Exception as e:
+            # 에러 발생 시 트랜잭션 롤백
+            logger.error(
+                "이벤트 처리 중 에러 발생 event_id=%s: %s",
+                event_id, str(e), exc_info=True
+            )
             try:
-                candidate_news = self._load_candidate_news_for_event(
-                    conn=conn,
-                    event_id=event_id,
-                    limit=self.eval_candidate_limit,
-                )
-
-                if not candidate_news:
-                    logger.info("event_id=%s 연결된 뉴스가 없어 이벤트 요약을 생략합니다.", event_id)
-                    return
-
-                # 1) 뉴스별 LLM 재평가
-                evaluations = self._evaluate_news_candidates(event, candidate_news)
-
-                # 2) relevance_score 보정 반영
-                if update_relevance_scores and evaluations:
-                    self._apply_relevance_updates(conn, event_id, candidate_news, evaluations)
-
-                # 3) 보정된 기준으로 최종 요약용 뉴스 선별
-                summary_news = self._select_news_for_summary(candidate_news, evaluations)
-
-                # 4) 이벤트 summary 생성
-                summary_text = self._generate_event_summary(event, summary_news)
-
-                # 5) summary 저장
-                self._update_event_summary(conn, event_id, summary_text)
-
-                # 트랜잭션 커밋
-                conn.commit()
-                logger.info("이벤트 처리 완료 event_id=%s (커밋됨)", event_id)
-                
-            except Exception as e:
-                # 에러 발생 시 트랜잭션 롤백
+                conn.rollback()
+                logger.warning("트랜잭션 롤백 완료 event_id=%s", event_id)
+            except Exception as rollback_error:
                 logger.error(
-                    "이벤트 처리 중 에러 발생 event_id=%s: %s",
-                    event_id, str(e), exc_info=True
+                    "롤백 중 에러 발생 event_id=%s: %s",
+                    event_id, str(rollback_error), exc_info=True
                 )
-                try:
-                    conn.rollback()
-                    logger.warning("트랜잭션 롤백 완료 event_id=%s", event_id)
-                except Exception as rollback_error:
-                    logger.error(
-                        "롤백 중 에러 발생 event_id=%s: %s",
-                        event_id, str(rollback_error), exc_info=True
-                    )
-                raise  # 상위로 예외 전파
+                self._close_thread_conn()
+            raise  # 상위로 예외 전파
 
-    # -----------------------------
-    # DB Connection Management
-    # -----------------------------
-
+    # DB 연결 관리
     def _get_thread_conn(self) -> pymysql.connections.Connection:
-        """스레드별 DB 연결 획득 (재사용)"""
-        if not hasattr(self._thread_local, 'conn') or self._thread_local.conn is None:
+        conn = cast(pymysql.connections.Connection | None, getattr(self._thread_local, 'conn', None))
+        if conn is not None and not self._is_connection_alive(conn):
+            self._close_thread_conn()
+            conn = None
+
+        if conn is None:
             self._thread_local.conn = pymysql.connect(
                 **self.db_config,
                 cursorclass=pymysql.cursors.DictCursor,
@@ -269,21 +265,29 @@ class SummaryService:
             except Exception as e:
                 logger.warning("격리 수준 설정 실패: %s", str(e))
 
-        return self._thread_local.conn
+        return cast(pymysql.connections.Connection, self._thread_local.conn)
+
+    @staticmethod
+    def _is_connection_alive(conn) -> bool:
+        try:
+            if getattr(conn, "open", False) is False:
+                return False
+            conn.ping(reconnect=False)
+            return True
+        except Exception:
+            return False
 
     @contextmanager
     def _connect(self):
-        """컨텍스트 매니저로 DB 연결 관리 (메인 스레드용)"""
         conn = pymysql.connect(
             **self.db_config,
             cursorclass=pymysql.cursors.DictCursor,
             autocommit=False,
-            read_timeout=30,        # 읽기 타임아웃: 30초
-            write_timeout=30,       # 쓰기 타임아웃: 30초
-            connect_timeout=10,     # 연결 타임아웃: 10초
+            read_timeout=30,
+            write_timeout=30,
+            connect_timeout=10,
         )
         try:
-            # 트랜잭션 격리 수준 설정
             with conn.cursor() as cur:
                 cur.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
             logger.debug("메인 연결 격리 수준 설정: READ COMMITTED")
@@ -292,16 +296,18 @@ class SummaryService:
             logger.error("메인 연결 에러: %s", str(e), exc_info=True)
             try:
                 conn.rollback()
-            except:
+            except Exception:
                 pass
             raise
         finally:
             conn.close()
-    
+
     def _close_thread_conn(self) -> None:
-        """스레드 종료 시 연결 닫기"""
         if hasattr(self._thread_local, 'conn') and self._thread_local.conn is not None:
-            self._thread_local.conn.close()
+            try:
+                self._thread_local.conn.close()
+            except Exception:
+                pass
             self._thread_local.conn = None
 
     @staticmethod
@@ -347,10 +353,6 @@ class SummaryService:
 
     @staticmethod
     def _load_candidate_news_for_event(conn, event_id: int, limit: int) -> list[dict]:
-        """
-        event_news 상위 후보들만 가져온다.
-        100개 이상이어도 처음부터 전부 모델에 넣지 않기 위함.
-        """
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -404,25 +406,7 @@ class SummaryService:
                 rows,
             )
 
-    # -----------------------------
-    # LLM evaluation
-    # -----------------------------
-
     def _evaluate_news_candidates(self, event: dict, candidate_news: list[dict]) -> dict[int, dict]:
-        """
-        상위 후보 뉴스들을 청크로 나눠서 평가.
-        - 청크별로 LLM 호출 (병렬화 가능)
-        - 각 청크의 결과 병합
-        
-        반환:
-        {
-            news_id: {
-                "is_relevant": bool,
-                "reason": str,
-                "adjustment": float
-            }
-        }
-        """
         result: dict[int, dict] = {}
 
         chunks = self._chunked(candidate_news, self.eval_chunk_size)
@@ -471,7 +455,6 @@ class SummaryService:
 
     @staticmethod
     def _parse_evaluation_items(items: list) -> dict[int, dict]:
-        """평가 아이템 파싱 (에러 처리 강화)"""
         result: dict[int, dict] = {}
         for item in items:
             try:
@@ -495,11 +478,9 @@ class SummaryService:
         return result
 
     def _build_evaluation_prompt(self, event: dict, news_rows: list[dict]) -> str:
-        """평가용 프롬프트 생성 (최적화)"""
         news_blocks = []
         for idx, row in enumerate(news_rows, start=1):
             content = self._normalize_content(row.get("content", ""))
-            # 콘텐츠 길이 제한 (프롬프트 토큰 절감)
             if len(content) > self.content_char_limit:
                 content = content[:self.content_char_limit]
 
@@ -587,10 +568,11 @@ change_pct: {event["change_pct"]}
         updates: list[tuple] = []
 
         for row in candidate_news:
+            row = cast(dict[str, Any], row)
             news_id = row["news_id"]
             old_score = float(row.get("relevance_score") or 0.0)
 
-            evaluation = evaluations.get(news_id)
+            evaluation = cast(dict[str, Any] | None, evaluations.get(news_id))
             if not evaluation:
                 continue
 
@@ -621,8 +603,9 @@ change_pct: {event["change_pct"]}
         selected = []
 
         for row in candidate_news:
+            row = cast(dict[str, Any], row)
             news_id = row["news_id"]
-            evaluation = evaluations.get(news_id)
+            evaluation = cast(dict[str, Any] | None, evaluations.get(news_id))
             if not evaluation:
                 continue
 
@@ -727,7 +710,7 @@ change_pct: {event["change_pct"]}
     # OpenAI call (with retry & timeout)
     # -----------------------------
 
-    def _call_model(self, prompt: str, max_retries: int = 2) -> str:
+    def _call_model(self, prompt: str, max_retries: int | None = None) -> str:
         """
         OpenAI 호출 (재시도 로직 포함)
 
@@ -735,40 +718,45 @@ change_pct: {event["change_pct"]}
             prompt: 입력 프롬프트
             max_retries: 최대 재시도 횟수
         """
-        last_error = None
+        retries = self.openai_max_retries if max_retries is None else int(max_retries)
+        retries = max(0, retries)
+        total_attempts = retries + 1
 
-        for attempt in range(max_retries + 1):
+        for attempt in range(total_attempts):
             try:
-                response = self.client.messages.create(
-                    model=self.model,
-                    max_tokens=1024,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": prompt
-                        }
-                    ],
-                    timeout=30,
-                )
+                with self._openai_semaphore:
+                    response = self.client.responses.create(
+                        model=self.model,
+                        input=prompt,
+                        timeout=self.openai_timeout,
+                    )
 
-                # response 구조에 따라 적절히 처리
-                if hasattr(response, 'content') and response.content:
-                    if isinstance(response.content, list):
-                        return response.content[0].text.strip()
-                    return response.content.strip()
+                text = (getattr(response, "output_text", "") or "").strip()
+                if text:
+                    return text
 
                 return ""
 
             except Exception as e:
-                last_error = e
-                if attempt < max_retries:
+                if attempt < retries:
+                    current_attempt = attempt + 1
                     logger.warning(
-                        "OpenAI 호출 실패 (재시도 %d/%d): %s",
-                        attempt + 1, max_retries, str(e)
+                        "OpenAI 호출 실패 (시도 %d/%d, 재시도 예정): %s: %s",
+                        current_attempt,
+                        total_attempts,
+                        type(e).__name__,
+                        str(e),
                     )
-                    time.sleep(1)  # 재시도 전 대기
+                    # 과한 재시도 폭주를 피하려고 시도 횟수에 따라 대기 시간을 완만히 증가
+                    time.sleep(min(3.0, 1.0 + attempt * 0.5))
                 else:
-                    logger.error("OpenAI 호출 최종 실패: %s", str(e))
+                    logger.error(
+                        "OpenAI 호출 최종 실패 (시도 %d/%d): %s: %s",
+                        attempt + 1,
+                        total_attempts,
+                        type(e).__name__,
+                        str(e),
+                    )
 
         logger.error("모든 재시도 실패, 빈 문자열 반환")
         return ""
@@ -817,7 +805,7 @@ change_pct: {event["change_pct"]}
             pass
 
         # 2차: JSON 객체 부분만 추출
-        match = re.search(r"\{.*\}", text, re.DOTALL)
+        match = re.search(r"{.*}", text, re.DOTALL)
         if match:
             try:
                 return json.loads(match.group(0))
@@ -826,11 +814,3 @@ change_pct: {event["change_pct"]}
 
         logger.warning("JSON 파싱 실패, 원문 일부=%s", text[:300])
         return {}
-
-    def _get_event_lock(self, event_id: int) -> threading.Lock:
-        """이벤트별 Lock 획득 (동시 접근 제어)"""
-        with self._locks_lock:
-            if event_id not in self._event_locks:
-                self._event_locks[event_id] = threading.Lock()
-            return self._event_locks[event_id]
-
