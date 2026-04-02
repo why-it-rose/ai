@@ -232,7 +232,7 @@ class RequestGenerator:
         return repaired
 
     def generate_today(self) -> CrawlJobRequest:
-        today = date.today()
+        today = date.today() - timedelta(days=1)
 
         with self._connect() as conn:
             stocks = self._load_today_target_stocks(conn)
